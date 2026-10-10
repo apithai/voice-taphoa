@@ -1,0 +1,5 @@
+{
+  "name": "VoiceStock - Quản Lý Bán Hàng & Tồn Kho Bằng Giọng Nói",
+  "description": "Hệ thống quản lý bán hàng và tồn kho bằng giọng nói tiếng Việt thời gian thực, kết nối Google Sheets và Telegram Bot.",
+  "requestFramePermissions": ["microphone"]
+}
