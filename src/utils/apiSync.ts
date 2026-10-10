@@ -110,62 +110,60 @@ export function formatDateTime(isoString: string): string {
   }
 }
 
+/** Chuyển một giao dịch thành payload gửi lên Apps Script */
+function toSheetTransaction(t: Transaction) {
+  return {
+    id: t.id,
+    batchId: t.batchId || t.id,
+    timestamp: t.timestamp,
+    formattedTime: t.formattedTime,
+    type: t.type, // 'NHAP' | 'BAN'
+    typeText: t.type === 'NHAP' ? 'Nhập hàng' : 'Bán hàng',
+    productName: t.productName,
+    quantity: t.quantity,
+    unit: t.unit,
+    unitPrice: t.unitPrice || 0,
+    totalPrice: t.totalPrice || 0,
+    priceAuto: t.priceAuto === true,
+    rawTranscript: t.rawTranscript,
+  };
+}
+
 /**
- * Gửi giao dịch đến Webhook Google Apps Script
+ * Gửi CẢ MỘT LỆNH (có thể nhiều mặt hàng) tới Apps Script trong MỘT request.
+ * Apps Script ghi tất cả các dòng, tính lại tồn kho, rồi gửi MỘT tin Telegram tổng hợp.
  */
-export async function syncToGoogleSheets(
+export async function syncBatchToGoogleSheets(
   webhookUrl: string,
-  transaction: Transaction,
-  stockItem?: InventoryItem
+  transactions: Transaction[],
+  telegram?: { botToken: string; chatId: string }
 ): Promise<{ success: boolean; message: string }> {
   if (!webhookUrl || !webhookUrl.startsWith('http')) {
     return { success: false, message: 'Chưa cấu hình URL Webhook Google Sheets.' };
   }
+  if (transactions.length === 0) {
+    return { success: false, message: 'Không có giao dịch để gửi.' };
+  }
 
   const payload = {
-    action: 'RECORD_TRANSACTION',
-    transaction: {
-      id: transaction.id,
-      batchId: transaction.batchId || transaction.id,
-      timestamp: transaction.timestamp,
-      formattedTime: transaction.formattedTime,
-      type: transaction.type, // 'NHAP' | 'BAN'
-      typeText: transaction.type === 'NHAP' ? 'Nhập hàng' : 'Bán hàng',
-      productName: transaction.productName,
-      quantity: transaction.quantity,
-      unit: transaction.unit,
-      unitPrice: transaction.unitPrice || 0,
-      totalPrice: transaction.totalPrice || 0,
-      priceAuto: transaction.priceAuto === true,
-      rawTranscript: transaction.rawTranscript,
-    },
-    inventory: stockItem
-      ? {
-          productName: stockItem.productName,
-          unit: stockItem.unit,
-          totalImport: stockItem.totalImport,
-          totalExport: stockItem.totalExport,
-          currentStock: stockItem.currentStock,
-        }
-      : null,
+    action: 'RECORD_BATCH',
+    transactions: transactions.map(toSheetTransaction),
+    // Apps Script gửi Telegram kèm tồn kho lấy từ sheet (nếu có cấu hình)
+    telegram:
+      telegram && telegram.botToken && telegram.chatId
+        ? { botToken: telegram.botToken.trim(), chatId: telegram.chatId.trim() }
+        : null,
   };
 
   try {
-    // Với Google Apps Script, trình duyệt thường gặp CORS redirect.
-    // Dùng mode: 'no-cors' để request được gửi thành công đến Google Apps Script server
+    // Apps Script trả CORS khác nhau tuỳ trình duyệt; no-cors đảm bảo request được gửi đi.
     await fetch(webhookUrl, {
       method: 'POST',
       mode: 'no-cors',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     });
-
-    return {
-      success: true,
-      message: 'Đã gửi dữ liệu đồng bộ tới Google Sheets!',
-    };
+    return { success: true, message: 'Đã gửi dữ liệu đồng bộ tới Google Sheets!' };
   } catch (error) {
     console.error('Lỗi gửi tới Google Sheets:', error);
     return {
@@ -173,6 +171,63 @@ export async function syncToGoogleSheets(
       message: `Lỗi kết nối Google Sheets: ${(error as Error).message}`,
     };
   }
+}
+
+/** Gửi một giao dịch (giữ tương thích với chỗ gửi lại từ tab Lịch sử) */
+export async function syncToGoogleSheets(
+  webhookUrl: string,
+  transaction: Transaction,
+  _stockItem?: InventoryItem,
+  telegram?: { botToken: string; chatId: string }
+): Promise<{ success: boolean; message: string }> {
+  return syncBatchToGoogleSheets(webhookUrl, [transaction], telegram);
+}
+
+/**
+ * Tin Telegram dự phòng do APP gửi khi không đẩy được lên sheet.
+ * Cùng bố cục với Apps Script; không có cột tồn kho vì app không biết tồn thật.
+ */
+export function buildTelegramBatchText(transactions: Transaction[]): string {
+  const esc = (v: unknown) => String(v ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const NAME_W = 17;
+  const padR = (s: unknown, n: number) => {
+    const t = String(s);
+    return t.length >= n ? t.slice(0, n) : t + ' '.repeat(n - t.length);
+  };
+  const padL = (s: unknown, n: number) => {
+    const t = String(s);
+    return t.length >= n ? t : ' '.repeat(n - t.length) + t;
+  };
+  const num = (n: number) => String(Math.round(n || 0)).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+
+  const sales = transactions.filter((t) => t.type === 'BAN');
+  const imports = transactions.filter((t) => t.type === 'NHAP');
+  const title =
+    sales.length && !imports.length
+      ? '🔴 <b>BÁN HÀNG</b>'
+      : imports.length && !sales.length
+        ? '🟢 <b>NHẬP KHO</b>'
+        : '🔵 <b>GIAO DỊCH KHO</b>';
+
+  const table = [padR('Mặt hàng', NAME_W) + ' ' + padL('SL', 3) + ' ' + padL('Đơn giá', 8) + ' ' + padL('Tiền', 9)];
+  transactions.forEach((t) => {
+    table.push(
+      padR(t.productName, NAME_W) + ' ' +
+      padL(t.quantity, 3) + ' ' +
+      padL(t.unitPrice ? num(t.unitPrice) : '—', 8) + ' ' +
+      padL(t.totalPrice ? num(t.totalPrice) : '—', 9)
+    );
+  });
+
+  let text = `${title} · ${transactions.length} mặt hàng\n\n<pre>${esc(table.join('\n'))}</pre>\n`;
+  const saleTotal = sales.reduce((a, t) => a + (t.totalPrice || 0), 0);
+  const importTotal = imports.reduce((a, t) => a + (t.totalPrice || 0), 0);
+  if (saleTotal > 0) text += `💰 <b>Tổng tiền bán:</b> ${num(saleTotal)} đ\n`;
+  if (importTotal > 0) text += `📥 <b>Tổng tiền nhập:</b> ${num(importTotal)} đ\n`;
+  text += `\n⏰ ${esc(transactions[0].formattedTime)}\n`;
+  text += `🗣️ <i>"${esc(transactions[0].rawTranscript)}"</i>\n\n`;
+  text += `⚡ <i>VoiceStock · Quản lý tồn kho tức thì</i>`;
+  return text;
 }
 
 /**

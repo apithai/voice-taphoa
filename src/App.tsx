@@ -38,8 +38,10 @@ import {
   INITIAL_INVENTORY,
   formatVND,
   formatDateTime,
+  syncBatchToGoogleSheets,
   syncToGoogleSheets,
   testGoogleSheetsConnection,
+  buildTelegramBatchText,
   sendTelegramMessage,
   buildTelegramTransactionText,
   applyAutoPrice,
@@ -779,27 +781,26 @@ export default function App() {
     }
 
     // Đồng bộ Google Sheets (mỗi mặt hàng một dòng, cùng Mã Lô)
-    if (settings.googleSheetsWebhook) {
-      newTxs.forEach((t, i) => {
-        syncToGoogleSheets(settings.googleSheetsWebhook, t, updatedItems[i]).then((res) => {
-          const nextStatus = res.success ? 'sent_unconfirmed' : 'failed';
-          setHistory((prev) =>
-            prev.map((x) => (x.id === t.id ? { ...x, sheetsSyncStatus: nextStatus } : x))
-          );
-        });
-      });
-    }
+    // Telegram: có webhook thì Apps Script gửi MỘT tin cho cả lệnh (tồn kho lấy từ sheet);
+    // không có webhook, hoặc không đẩy được lên sheet, thì app tự gửi một tin tổng hợp.
+    const tgCfg =
+      settings.telegramBotToken && settings.telegramChatId
+        ? { botToken: settings.telegramBotToken, chatId: settings.telegramChatId }
+        : undefined;
 
-    // Gửi Telegram
-    if (settings.telegramBotToken && settings.telegramChatId) {
-      newTxs.forEach((t, i) => {
-        const tgText = buildTelegramTransactionText(t, updatedItems[i]);
-        sendTelegramMessage(settings.telegramBotToken, settings.telegramChatId, tgText).then((res) => {
-          if (res.success) {
-            setHistory((prev) => prev.map((x) => (x.id === t.id ? { ...x, syncedTelegram: true } : x)));
-          }
-        });
+    if (settings.googleSheetsWebhook) {
+      const ids = newTxs.map((t) => t.id);
+      syncBatchToGoogleSheets(settings.googleSheetsWebhook, newTxs, tgCfg).then((res) => {
+        const nextStatus = res.success ? 'sent_unconfirmed' : 'failed';
+        setHistory((prev) =>
+          prev.map((x) => (ids.includes(x.id) ? { ...x, sheetsSyncStatus: nextStatus } : x))
+        );
+        if (!res.success && tgCfg) {
+          sendTelegramMessage(tgCfg.botToken, tgCfg.chatId, buildTelegramBatchText(newTxs));
+        }
       });
+    } else if (tgCfg) {
+      sendTelegramMessage(tgCfg.botToken, tgCfg.chatId, buildTelegramBatchText(newTxs));
     }
 
     // Thông báo và reset

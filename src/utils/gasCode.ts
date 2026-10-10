@@ -3,175 +3,756 @@
  */
 export const GOOGLE_APPS_SCRIPT_CODE = `/**
  * ==============================================================================
- * HỆ THỐNG QUẢN LÝ BÁN HÀNG & TỒN KHO BẰNG GIỌNG NÓI - VOICESTOCK
- * File: Code.gs (Dán vào Google Sheets > Tiện ích mở rộng > Apps Script)
- * Chức năng:
- * 1. Nhận POST data từ Web App thời gian thực
- * 2. Tự động khởi tạo & cập nhật 3 Sheet:
- *    - 'LichSuGiaoDich': Nhật ký mọi lần nhập/bán hàng chi tiết
- *    - 'TonKho': Tự động tính Tồn kho = Tổng Nhập - Tổng Bán
- *    - 'HeThongDebug': Nhật ký kiểm tra kết nối & gỡ lỗi (debug) hệ thống
- * 3. Hỗ trợ lệnh kiểm tra kết nối (TEST_CONNECTION / PING)
- * 4. (Tùy chọn) Gửi tin nhắn thông báo về Telegram Bot
+ * VOICESTOCK - Code.gs (dán vào Google Sheets > Tiện ích mở rộng > Apps Script)
+ *
+ * Các sheet:
+ *  - DanhMuc        : danh mục sản phẩm, giá bán / giá nhập (sửa giá ở đây)
+ *  - LichSuGiaoDich : nhật ký MỌI lần nhập / bán (nguồn dữ liệu gốc)
+ *  - BanHangNgay    : các dòng BÁN, tính lại từ LichSuGiaoDich mỗi lần ghi
+ *  - TonKho         : tính lại từ LichSuGiaoDich mỗi lần ghi
+ *  - Dashboard      : báo cáo theo ngày chọn ở ô B3, tự cập nhật
+ *  - HeThongDebug   : nhật ký kết nối và lỗi
+ *
+ * TonKho, BanHangNgay và Dashboard là sheet TỰ ĐỘNG: đừng nhập tay vào đó.
+ * Lần đầu, chọn hàm setupAllSheets ở thanh trên rồi bấm Chạy một lần.
  * ==============================================================================
  */
 
-// ==============================================================================
-// LƯU Ý QUAN TRỌNG VỀ TELEGRAM (TRÁNH GỬI TRÙNG LẶP):
-// Chỉ điền Telegram Bot Token & Chat ID ở MỘT NƠI DUY NHẤT:
-// - Cách 1 (Khuyên dùng): Điền Token và Chat ID trong Cài đặt của Web App.
-//   Khi đó, HÃY ĐỂ TRỐNG TELEGRAM_CONFIG dưới đây!
-// - Cách 2: Điền Token vào TELEGRAM_CONFIG dưới đây thì KHÔNG điền vào Cài đặt Web App.
-// TUYỆT ĐỐI KHÔNG ĐIỀN CẢ HAI NƠI để tránh gửi tin nhắn 2 lần cho mỗi giao dịch!
-// ==============================================================================
+// Chỉ điền Telegram ở MỘT nơi: để trống ở đây nếu đã điền trong Cài đặt Web App.
 const TELEGRAM_CONFIG = {
-  BOT_TOKEN: "", // Để trống nếu đã cấu hình trong Cài đặt Web App
-  CHAT_ID: ""    // Để trống nếu đã cấu hình trong Cài đặt Web App
+  BOT_TOKEN: "",
+  CHAT_ID: ""
 };
 
-/**
- * Xử lý yêu cầu GET: Kiểm tra tình trạng hoạt động và các sheet hiện có
- */
+const TZ = "Asia/Ho_Chi_Minh";
+const MAX_ROWS = 5000;
+
+const SHEET = {
+  CATALOG: "DanhMuc",
+  HISTORY: "LichSuGiaoDich",
+  SALES: "BanHangNgay",
+  STOCK: "TonKho",
+  DASH: "Dashboard",
+  DEBUG: "HeThongDebug"
+};
+
+const HEADERS = {
+  DanhMuc: ["Tên Sản Phẩm", "Đơn Vị", "Giá Bán (VNĐ)", "Giá Nhập (VNĐ)", "Tên Gọi Khác"],
+  LichSu: [
+    "Mã GD", "Mã Lô", "Ngày", "Thời Gian", "Loại", "Mã SP", "Tên Sản Phẩm",
+    "Số Lượng", "Đơn Vị", "Đơn Giá (VNĐ)", "Thành Tiền (VNĐ)", "Lợi Nhuận (VNĐ)", "Câu Thoại Gốc"
+  ],
+  BanHangNgay: [
+    "Ngày", "Giờ", "Mã Lô", "Mã SP", "Mặt Hàng", "Số Lượng", "Đơn Vị",
+    "Đơn Giá (VNĐ)", "Thành Tiền (VNĐ)", "Mã GD"
+  ],
+  TonKho: [
+    "Mã SP", "Tên Sản Phẩm", "Đơn Vị", "Tổng Nhập", "Tổng Bán",
+    "Tồn Kho Hiện Tại", "Giá Trị Tồn (VNĐ)", "Cảnh Báo"
+  ],
+  HeThongDebug: [
+    "Thời Gian", "Sự Kiện / Hành Động", "Trạng Thái", "Dữ Liệu Nhận Được (Payload)", "Chi Tiết / Thông Báo Lỗi"
+  ]
+};
+
+/* ------------------------------------------------------------------ */
+/*  Tiện ích                                                           */
+/* ------------------------------------------------------------------ */
+
+function jsonOut(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// Chuẩn hoá để so khớp: bỏ dấu, chữ thường, gộp khoảng trắng
+function normKey(s) {
+  return String(s === null || s === undefined ? "" : s)
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\\u0300-\\u036f]/g, "")
+    .replace(/đ/g, "d")
+    .replace(/\\s+/g, " ")
+    .trim();
+}
+
+// "4.500 đ", "4500", 4500 -> 4500
+function parseMoney(v) {
+  if (typeof v === "number") return v;
+  const digits = String(v === null || v === undefined ? "" : v).replace(/[^\\d]/g, "");
+  return digits ? Number(digits) : 0;
+}
+
+// Ngày thuần (00:00) theo múi giờ VN, để SUMIFS và so sánh ngày chính xác
+function dayOf(d) {
+  const p = Utilities.formatDate(d, TZ, "yyyy-MM-dd").split("-");
+  return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]));
+}
+
+function colLetter(n) {
+  let s = "";
+  let x = n;
+  while (x > 0) {
+    const r = (x - 1) % 26;
+    s = String.fromCharCode(65 + r) + s;
+    x = Math.floor((x - 1) / 26);
+  }
+  return s;
+}
+
+// "00:59:52 10/10/2026" -> Date(2026, 9, 10)
+function parseLegacyTime(s) {
+  if (s instanceof Date) return null;
+  const m = String(s || "").match(/(\\d{1,2}):(\\d{2})(?::\\d{2})?\\s+(\\d{1,2})\\/(\\d{1,2})\\/(\\d{4})/);
+  if (!m) return null;
+  return new Date(Number(m[5]), Number(m[4]) - 1, Number(m[3]));
+}
+
+/* ------------------------------------------------------------------ */
+/*  Sheet helpers                                                      */
+/* ------------------------------------------------------------------ */
+
+function styleHeader(sh, n) {
+  sh.getRange(1, 1, 1, n)
+    .setFontWeight("bold")
+    .setFontColor("#FFFFFF")
+    .setBackground("#334155")
+    .setHorizontalAlignment("center")
+    .setVerticalAlignment("middle");
+  sh.setRowHeight(1, 35);
+  sh.setFrozenRows(1);
+}
+
+// Tên cột -> số thứ tự cột (1-based), dùng tên đầu tiên nếu trùng
+function headerMap(sh) {
+  const lc = Math.max(sh.getLastColumn(), 1);
+  const row = sh.getRange(1, 1, 1, lc).getValues()[0];
+  const map = {};
+  row.forEach((v, i) => {
+    const k = String(v).trim();
+    if (k && !(k in map)) map[k] = i + 1;
+  });
+  return map;
+}
+
+// Tạo sheet nếu chưa có; nếu có rồi thì chỉ THÊM cột còn thiếu vào cuối, không xoá dữ liệu cũ
+function ensureSheet(ss, name, headers) {
+  let sh = ss.getSheetByName(name);
+  if (!sh) {
+    sh = ss.insertSheet(name);
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    styleHeader(sh, headers.length);
+    return sh;
+  }
+  if (sh.getLastRow() === 0 || sh.getLastColumn() === 0) {
+    sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+    styleHeader(sh, headers.length);
+    return sh;
+  }
+  const map = headerMap(sh);
+  const missing = headers.filter((h) => !(h in map));
+  if (missing.length > 0) {
+    const start = sh.getLastColumn() + 1;
+    sh.getRange(1, start, 1, missing.length).setValues([missing]);
+    styleHeader(sh, sh.getLastColumn());
+  }
+  return sh;
+}
+
+// Sheet nhật ký: nếu tiêu đề không đủ như chuẩn (sheet cũ) thì tạo lại sạch để tránh lệch cột
+function ensureLogSheet(ss, name, headers) {
+  const sh = ss.getSheetByName(name);
+  if (sh) {
+    const map = headerMap(sh);
+    const ok = headers.every((h) => h in map);
+    if (!ok) ss.deleteSheet(sh);
+  }
+  return ensureSheet(ss, name, headers);
+}
+
+// Xoá và tạo lại sheet tự động
+function recreateSheet(ss, name, headers) {
+  const old = ss.getSheetByName(name);
+  if (old) ss.deleteSheet(old);
+  const sh = ss.insertSheet(name);
+  sh.getRange(1, 1, 1, headers.length).setValues([headers]);
+  styleHeader(sh, headers.length);
+  return sh;
+}
+
+// Ghi một dòng theo tên cột. Trả về số dòng vừa ghi.
+function appendByHeader(sh, obj) {
+  const map = headerMap(sh);
+  const lc = sh.getLastColumn();
+  const row = new Array(lc).fill("");
+  Object.keys(obj).forEach((k) => {
+    if (map[k]) row[map[k] - 1] = obj[k];
+  });
+  const target = sh.getLastRow() + 1;
+  sh.getRange(target, 1, 1, lc).setValues([row]);
+  return target;
+}
+
+// Định dạng một ô theo tên cột
+function formatCells(sh, rowNum, formats) {
+  const map = headerMap(sh);
+  Object.keys(formats).forEach((name) => {
+    if (map[name]) sh.getRange(rowNum, map[name]).setNumberFormat(formats[name]);
+  });
+}
+
+// Đọc toàn bộ dòng dữ liệu thành object theo tên cột
+function readObjects(sh) {
+  const last = sh.getLastRow();
+  if (last < 2) return [];
+  const lc = sh.getLastColumn();
+  const head = sh.getRange(1, 1, 1, lc).getValues()[0].map((v) => String(v).trim());
+  const data = sh.getRange(2, 1, last - 1, lc).getValues();
+  return data.map((row) => {
+    const o = {};
+    head.forEach((h, i) => {
+      if (h && !(h in o)) o[h] = row[i];
+    });
+    return o;
+  });
+}
+
+/* ------------------------------------------------------------------ */
+/*  Danh mục sản phẩm                                                  */
+/* ------------------------------------------------------------------ */
+
+// Đọc DanhMuc. Cột A là MÃ sản phẩm; cụm đầu tiên của "Tên Gọi Khác" là TÊN HIỂN THỊ.
+function getCatalog(ss) {
+  const sh = ss.getSheetByName(SHEET.CATALOG);
+  if (!sh || sh.getLastRow() < 2) return [];
+
+  const values = sh.getDataRange().getValues();
+  const head = values[0].map((v) => normKey(v));
+  const col = (label, dflt) => {
+    const i = head.indexOf(normKey(label));
+    return i >= 0 ? i : dflt;
+  };
+  const iUnit = col("Đơn Vị", 1);
+  const iSell = col("Giá Bán (VNĐ)", 2);
+  const iImp = col("Giá Nhập (VNĐ)", 3);
+  const iAlias = col("Tên Gọi Khác", 4);
+
+  const items = [];
+  for (let r = 1; r < values.length; r++) {
+    const row = values[r];
+    const code = String(row[0] === null ? "" : row[0]).trim();
+    if (!code) continue;
+    const aliases = String(row[iAlias] || "")
+      .split(/[;|]/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+    items.push({
+      code: code,
+      name: aliases.length > 0 ? aliases[0] : code,
+      unit: String(row[iUnit] || "").trim() || "cái",
+      sellPrice: parseMoney(row[iSell]),
+      importPrice: parseMoney(row[iImp]),
+      aliases: aliases
+    });
+  }
+  return items;
+}
+
+// Tìm sản phẩm theo mã / tên hiển thị / tên gọi khác. Chỉ trả về khi KHỚP DUY NHẤT.
+function findCatalogItem(name, catalog) {
+  const key = normKey(name);
+  if (!key) return null;
+
+  // 1) Mã hoặc tên hiển thị trùng khít
+  const direct = catalog.filter((it) => normKey(it.code) === key || normKey(it.name) === key);
+  if (direct.length === 1) return direct[0];
+  if (direct.length > 1) return null;
+
+  // 2) Tên gọi khác trùng khít
+  const byAlias = catalog.filter((it) => it.aliases.some((a) => normKey(a) === key));
+  return byAlias.length === 1 ? byAlias[0] : null;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Lịch sử: bổ sung cột thiếu, sửa dữ liệu cũ                          */
+/* ------------------------------------------------------------------ */
+
+function migrateHistory(sh, catalog) {
+  const last = sh.getLastRow();
+  if (last < 2) return;
+
+  const map = headerMap(sh);
+  const lc = sh.getLastColumn();
+  const range = sh.getRange(2, 1, last - 1, lc);
+  const data = range.getValues();
+
+  let changed = false;
+  const idx = (name) => (map[name] ? map[name] - 1 : -1);
+  const setIf = (row, name, value) => {
+    const i = idx(name);
+    if (i >= 0 && row[i] !== value) {
+      row[i] = value;
+      changed = true;
+    }
+  };
+
+  data.forEach((row) => {
+    // Ngày: lấy từ cột Thời Gian cũ
+    if (!row[idx("Ngày")]) {
+      const d = parseLegacyTime(row[idx("Thời Gian")]);
+      if (d) setIf(row, "Ngày", d);
+    }
+
+    // Mã SP: dòng cũ chỉ có tên
+    if (!row[idx("Mã SP")]) {
+      const name = String(row[idx("Tên Sản Phẩm")] || "").trim();
+      if (name) {
+        const it = findCatalogItem(name, catalog);
+        setIf(row, "Mã SP", it ? it.code : name);
+      }
+    }
+
+    // Số tiền dạng chữ ("4.500 đ") -> số
+    ["Đơn Giá (VNĐ)", "Thành Tiền (VNĐ)"].forEach((n) => {
+      const i = idx(n);
+      if (i >= 0 && typeof row[i] === "string" && row[i] !== "") {
+        setIf(row, n, parseMoney(row[i]));
+      }
+    });
+
+    // Dòng BÁN chưa có giá nhưng sản phẩm đã có trong DanhMuc: bù giá và tính lại
+    if (String(row[idx("Loại")]) === "BÁN HÀNG") {
+      const qty = Number(row[idx("Số Lượng")]) || 0;
+      const it = findCatalogItem(String(row[idx("Mã SP")] || ""), catalog);
+      const curPrice = parseMoney(row[idx("Đơn Giá (VNĐ)")]);
+      if (it && curPrice === 0 && it.sellPrice > 0) {
+        setIf(row, "Đơn Giá (VNĐ)", it.sellPrice);
+        setIf(row, "Thành Tiền (VNĐ)", Math.round(it.sellPrice * qty));
+        setIf(row, "Lợi Nhuận (VNĐ)", Math.round(it.sellPrice * qty) - qty * it.importPrice);
+      } else if (it && row[idx("Lợi Nhuận (VNĐ)")] === "" && curPrice > 0) {
+        setIf(row, "Lợi Nhuận (VNĐ)", parseMoney(row[idx("Thành Tiền (VNĐ)")]) - qty * it.importPrice);
+      }
+    }
+  });
+
+  if (changed) range.setValues(data);
+}
+
+/* ------------------------------------------------------------------ */
+/*  BanHangNgay: tính lại từ LichSuGiaoDich                              */
+/* ------------------------------------------------------------------ */
+
+function rebuildSales(ss, histRows) {
+  const sales = recreateSheet(ss, SHEET.SALES, HEADERS.BanHangNgay);
+  const rows = histRows
+    .filter((o) => o["Loại"] === "BÁN HÀNG")
+    .map((o) => [
+      o["Ngày"] || "",
+      String(o["Thời Gian"] || "").slice(0, 5),
+      o["Mã Lô"] || "",
+      o["Mã SP"] || "",
+      o["Tên Sản Phẩm"] || "",
+      Number(o["Số Lượng"]) || 0,
+      o["Đơn Vị"] || "",
+      parseMoney(o["Đơn Giá (VNĐ)"]),
+      parseMoney(o["Thành Tiền (VNĐ)"]),
+      o["Mã GD"] || ""
+    ]);
+
+  if (rows.length > 0) {
+    sales.getRange(2, 1, rows.length, HEADERS.BanHangNgay.length).setValues(rows);
+    sales.getRange(2, 1, rows.length, 1).setNumberFormat("dd/MM/yyyy");
+    sales.getRange(2, 8, rows.length, 2).setNumberFormat("#,##0");
+  }
+  sales.getRange(1, 1, 1000, HEADERS.BanHangNgay.length).createFilter();
+  sales.setColumnWidth(5, 240);
+}
+
+/* ------------------------------------------------------------------ */
+/*  TonKho: tính lại từ LichSuGiaoDich                                  */
+/* ------------------------------------------------------------------ */
+
+function rebuildStock(ss, histRows, catalog) {
+  const stock = {};
+  catalog.forEach((it) => {
+    stock[it.code] = { name: it.name, unit: it.unit, imp: 0, sold: 0, price: it.importPrice };
+  });
+
+  histRows.forEach((o) => {
+    const key = String(o["Mã SP"] || o["Tên Sản Phẩm"] || "").trim();
+    if (!key) return;
+    if (!stock[key]) {
+      stock[key] = {
+        name: String(o["Tên Sản Phẩm"] || key),
+        unit: String(o["Đơn Vị"] || ""),
+        imp: 0,
+        sold: 0,
+        price: 0
+      };
+    }
+    const q = Number(o["Số Lượng"]) || 0;
+    if (o["Loại"] === "NHẬP HÀNG") stock[key].imp += q;
+    else if (o["Loại"] === "BÁN HÀNG") stock[key].sold += q;
+  });
+
+  const sh = recreateSheet(ss, SHEET.STOCK, HEADERS.TonKho);
+  const out = [];
+  const alerts = [];
+
+  Object.keys(stock).forEach((key) => {
+    const s = stock[key];
+    const cur = s.imp - s.sold;
+    let warn = "";
+    if (s.imp === 0 && s.sold === 0) warn = "";
+    else if (cur < 0) warn = "Bán vượt tồn (chưa nhập hàng?)";
+    else if (cur === 0) warn = "Hết hàng";
+    else if (cur <= 5) warn = "Sắp hết";
+    if (warn) alerts.push({ name: s.name, stock: cur, warn: warn });
+    out.push([key, s.name, s.unit, s.imp, s.sold, cur, cur > 0 ? cur * s.price : 0, warn]);
+  });
+
+  if (out.length > 0) {
+    sh.getRange(2, 1, out.length, HEADERS.TonKho.length).setValues(out);
+    sh.getRange(2, 4, out.length, 4).setNumberFormat("#,##0");
+  }
+  sh.setColumnWidth(1, 170);
+  sh.setColumnWidth(2, 260);
+  sh.setColumnWidth(8, 220);
+
+  const byKey = {};
+  Object.keys(stock).forEach((k) => {
+    byKey[k] = stock[k].imp - stock[k].sold;
+  });
+  return { alerts: alerts, byKey: byKey };
+}
+
+/* ------------------------------------------------------------------ */
+/*  Dashboard (công thức theo ngày chọn ở B3)                            */
+/* ------------------------------------------------------------------ */
+
+function rebuildDashboard(ss, hist, alerts) {
+  // Giữ ngày người dùng đã chọn ở B3 (nếu là ô =TODAY() thì giữ công thức)
+  let dateValue = "=TODAY()";
+  const old = ss.getSheetByName(SHEET.DASH);
+  if (old) {
+    const cell = old.getRange("B3");
+    const f = cell.getFormula();
+    if (f) dateValue = f;
+    else if (cell.getValue() instanceof Date) dateValue = cell.getValue();
+    ss.deleteSheet(old);
+  }
+
+  const sh = ss.insertSheet(SHEET.DASH);
+  const map = headerMap(hist);
+  const rng = (name) => {
+    const L = colLetter(map[name]);
+    return SHEET.HISTORY + "!$" + L + "$2:$" + L + "$" + MAX_ROWS;
+  };
+  const DATE = rng("Ngày");
+  const TYPE = rng("Loại");
+  const NAME = rng("Tên Sản Phẩm");
+  const QTY = rng("Số Lượng");
+  const TOTAL = rng("Thành Tiền (VNĐ)");
+  const PROFIT = rng("Lợi Nhuận (VNĐ)");
+  const BAN = "\\"BÁN HÀNG\\"";
+  const NHAP = "\\"NHẬP HÀNG\\"";
+
+  sh.getRange("A1:H1").merge()
+    .setValue("DASHBOARD BÁN HÀNG")
+    .setFontSize(16).setFontWeight("bold").setFontColor("#FFFFFF")
+    .setBackground("#7C2D12").setHorizontalAlignment("center");
+  sh.getRange("A2")
+    .setValue("Đổi ô B3 sang ngày khác để xem báo cáo của ngày đó. Số liệu tự cập nhật sau mỗi lần ghi.")
+    .setFontColor("#64748B").setFontStyle("italic");
+
+  sh.getRange("A3").setValue("Ngày xem:").setFontWeight("bold");
+  const b3 = sh.getRange("B3");
+  if (typeof dateValue === "string") b3.setFormula(dateValue);
+  else b3.setValue(dateValue);
+  b3.setNumberFormat("dd/MM/yyyy").setBackground("#FEF3C7").setFontWeight("bold");
+
+  const kpi = [
+    ["Số lần bán trong ngày", "=COUNTIFS(" + DATE + ",$B$3," + TYPE + "," + BAN + ")"],
+    ["Số lượng hàng bán trong ngày", "=SUMIFS(" + QTY + "," + DATE + ",$B$3," + TYPE + "," + BAN + ")"],
+    ["Doanh thu trong ngày (VNĐ)", "=SUMIFS(" + TOTAL + "," + DATE + ",$B$3," + TYPE + "," + BAN + ")"],
+    ["Lợi nhuận trong ngày (VNĐ)", "=SUMIFS(" + PROFIT + "," + DATE + ",$B$3," + TYPE + "," + BAN + ")"],
+    ["Tiền nhập hàng trong ngày (VNĐ)", "=SUMIFS(" + TOTAL + "," + DATE + ",$B$3," + TYPE + "," + NHAP + ")"],
+    ["Doanh thu toàn bộ (VNĐ)", "=SUMIFS(" + TOTAL + "," + TYPE + "," + BAN + ")"],
+    ["Lợi nhuận toàn bộ (VNĐ)", "=SUMIFS(" + PROFIT + "," + TYPE + "," + BAN + ")"],
+    ["Mặt hàng cần chú ý (xem cảnh báo bên phải)", alerts.length]
+  ];
+  sh.getRange(5, 1, kpi.length, 2).setFormulas(kpi);
+  sh.getRange("B5:B12").setNumberFormat("#,##0").setFontWeight("bold").setFontColor("#0F766E");
+
+  // Chi tiết theo mặt hàng của ngày đã chọn
+  sh.getRange("A14").setValue("Chi tiết theo mặt hàng (ngày đã chọn)").setFontWeight("bold");
+  sh.getRange("A15:D15").setValues([["Mặt hàng", "Số lượng", "Doanh thu (VNĐ)", "Lợi nhuận (VNĐ)"]])
+    .setFontWeight("bold").setFontColor("#FFFFFF").setBackground("#334155");
+  sh.getRange("A16").setFormula(
+    "=IFERROR(SORT(UNIQUE(FILTER(" + NAME + "," + DATE + "=$B$3," + TYPE + "=" + BAN + "," + NAME + "<>\\"\\"))),\\"\\")"
+  );
+  sh.getRange("B16").setFormula(
+    "=ARRAYFORMULA(IF(A16:A200=\\"\\",\\"\\",SUMIFS(" + QTY + "," + NAME + ",A16:A200," + DATE + ",$B$3," + TYPE + "," + BAN + ")))"
+  );
+  sh.getRange("C16").setFormula(
+    "=ARRAYFORMULA(IF(A16:A200=\\"\\",\\"\\",SUMIFS(" + TOTAL + "," + NAME + ",A16:A200," + DATE + ",$B$3," + TYPE + "," + BAN + ")))"
+  );
+  sh.getRange("D16").setFormula(
+    "=ARRAYFORMULA(IF(A16:A200=\\"\\",\\"\\",SUMIFS(" + PROFIT + "," + NAME + ",A16:A200," + DATE + ",$B$3," + TYPE + "," + BAN + ")))"
+  );
+
+  // Doanh thu theo ngày
+  sh.getRange("F14").setValue("Doanh thu theo ngày").setFontWeight("bold");
+  sh.getRange("F15:H15").setValues([["Ngày", "Doanh thu (VNĐ)", "Lợi nhuận (VNĐ)"]])
+    .setFontWeight("bold").setFontColor("#FFFFFF").setBackground("#334155");
+  sh.getRange("F16").setFormula(
+    "=IFERROR(SORT(UNIQUE(FILTER(" + DATE + "," + TYPE + "=" + BAN + "," + DATE + "<>\\"\\")),1,FALSE),\\"\\")"
+  );
+  sh.getRange("G16").setFormula(
+    "=ARRAYFORMULA(IF(F16:F200=\\"\\",\\"\\",SUMIFS(" + TOTAL + "," + DATE + ",F16:F200," + TYPE + "," + BAN + ")))"
+  );
+  sh.getRange("H16").setFormula(
+    "=ARRAYFORMULA(IF(F16:F200=\\"\\",\\"\\",SUMIFS(" + PROFIT + "," + DATE + ",F16:F200," + TYPE + "," + BAN + ")))"
+  );
+  sh.getRange("F16:F200").setNumberFormat("dd/MM/yyyy");
+  sh.getRange("C16:D200").setNumberFormat("#,##0");
+  sh.getRange("G16:H200").setNumberFormat("#,##0");
+
+  // Cảnh báo tồn kho (cập nhật sau mỗi lần ghi)
+  sh.getRange("J14").setValue("Cảnh báo tồn kho").setFontWeight("bold");
+  sh.getRange("J15:L15").setValues([["Mặt hàng", "Tồn kho", "Tình trạng"]])
+    .setFontWeight("bold").setFontColor("#FFFFFF").setBackground("#334155");
+  if (alerts.length > 0) {
+    sh.getRange(16, 10, alerts.length, 3).setValues(alerts.map((a) => [a.name, a.stock, a.warn]));
+  } else {
+    sh.getRange("J16").setValue("Không có mặt hàng cần chú ý.").setFontStyle("italic");
+  }
+
+  const widths = { 1: 260, 2: 130, 3: 150, 4: 150, 5: 20, 6: 120, 7: 150, 8: 150, 9: 20, 10: 240, 11: 100, 12: 230 };
+  Object.keys(widths).forEach((c) => sh.setColumnWidth(Number(c), widths[c]));
+  sh.setHiddenGridlines(true);
+}
+
+/* ------------------------------------------------------------------ */
+/*  Web App: GET                                                       */
+/* ------------------------------------------------------------------ */
+
 function doGet(e) {
   try {
     const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const sheets = ss.getSheets().map(s => s.getName());
-    return ContentService.createTextOutput(JSON.stringify({
+    const action = e && e.parameter && e.parameter.action ? e.parameter.action : "";
+
+    // App tải danh mục giá từ sheet DanhMuc
+    if (action === "catalog") {
+      const items = getCatalog(ss);
+      return jsonOut({
+        status: "success",
+        count: items.length,
+        items: items.map((it) => ({
+          code: it.code,
+          name: it.name,
+          unit: it.unit,
+          sellPrice: it.sellPrice,
+          importPrice: it.importPrice,
+          aliases: it.aliases
+        })),
+        timestamp: new Date().toISOString()
+      });
+    }
+
+    return jsonOut({
       status: "success",
       message: "VoiceStock Webhook Google Apps Script đang hoạt động tốt!",
       spreadsheetName: ss.getName(),
-      sheets: sheets,
+      sheets: ss.getSheets().map((s) => s.getName()),
       timestamp: new Date().toISOString()
-    })).setMimeType(ContentService.MimeType.JSON);
+    });
   } catch (err) {
-    return ContentService.createTextOutput(JSON.stringify({
-      status: "error",
-      message: err.toString()
-    })).setMimeType(ContentService.MimeType.JSON);
+    return jsonOut({ status: "error", message: err.toString() });
   }
 }
 
-/**
- * Xử lý yêu cầu POST từ Web App
- */
+/* ------------------------------------------------------------------ */
+/*  Web App: POST                                                      */
+/* ------------------------------------------------------------------ */
+
 function doPost(e) {
   const lock = LockService.getScriptLock();
-  let ss;
+  let ss = null;
   let rawContent = "";
 
   try {
-    // Khóa tối đa 10 giây tránh xung đột khi nhiều người ghi đồng thời
-    lock.waitLock(10000);
-
+    lock.waitLock(15000);
     ss = SpreadsheetApp.getActiveSpreadsheet();
-    let data;
-    
-    if (e && e.postData && e.postData.contents) {
-      rawContent = e.postData.contents;
-      data = JSON.parse(rawContent);
-    } else {
+
+    if (!(e && e.postData && e.postData.contents)) {
       throw new Error("Không tìm thấy dữ liệu POST từ Web App.");
     }
+    rawContent = e.postData.contents;
+    const data = JSON.parse(rawContent);
 
-    // 1. Xử lý sự kiện kiểm tra kết nối (TEST / PING)
     if (data.action === "TEST_CONNECTION" || data.action === "PING") {
       logDebug(ss, "KIỂM TRA KẾT NỐI", "THÀNH CÔNG", rawContent, "Nhận tín hiệu test kết nối từ Web App thành công.");
-      return ContentService.createTextOutput(JSON.stringify({
+      return jsonOut({
         status: "success",
         message: "Kết nối thành công! Đã ghi log kiểm tra vào sheet HeThongDebug.",
         timestamp: new Date().toISOString()
-      })).setMimeType(ContentService.MimeType.JSON);
+      });
     }
 
-    // 2. Xử lý ghi nhận giao dịch nhập / bán hàng
-    const tx = data.transaction;
-    if (!tx) {
-      throw new Error("Dữ liệu giao dịch (transaction) không hợp lệ.");
-    }
+    const txs = Array.isArray(data.transactions)
+      ? data.transactions
+      : data.transaction ? [data.transaction] : [];
+    if (txs.length === 0) throw new Error("Dữ liệu giao dịch (transaction) không hợp lệ.");
 
-    // Ghi vào Sheet 'LichSuGiaoDich'
-    const historySheet = getOrCreateSheet(ss, "LichSuGiaoDich", [
-      "Mã GD", "Thời Gian", "Loại", "Tên Sản Phẩm", "Số Lượng", "Đơn Vị", "Đơn Giá (VNĐ)", "Thành Tiền (VNĐ)", "Câu Thoại Gốc"
-    ], ["#1E293B", "#334155"]);
+    saveBatch(ss, txs, rawContent, data.telegram || null);
 
-    historySheet.appendRow([
-      tx.id || Utilities.getUuid().slice(0, 8),
-      tx.formattedTime || Utilities.formatDate(new Date(), "Asia/Ho_Chi_Minh", "HH:mm:ss dd/MM/yyyy"),
-      tx.type === "NHAP" ? "NHẬP HÀNG" : "BÁN HÀNG",
-      tx.productName,
-      tx.quantity,
-      tx.unit || "cái",
-      tx.unitPrice || 0,
-      tx.totalPrice || 0,
-      tx.rawTranscript || ""
-    ]);
-
-    // Định dạng tiền tệ cho cột Đơn Giá và Thành Tiền
-    const lastRowHist = historySheet.getLastRow();
-    historySheet.getRange(lastRowHist, 7, 1, 2).setNumberFormat("#,##0 \\"đ\\"");
-
-    // Cập nhật vào Sheet 'TonKho'
-    const stockSheet = getOrCreateSheet(ss, "TonKho", [
-      "Tên Sản Phẩm", "Đơn Vị", "Tổng Nhập", "Tổng Bán", "Tồn Kho Hiện Tại", "Cập Nhật Cuối"
-    ], ["#0F766E", "#115E59"]);
-
-    updateInventory(stockSheet, tx);
-
-    // Với giao dịch BÁN: ghi thêm vào sheet 'BanHangNgay' (lọc được theo ngày) và cập nhật 'Dashboard'
-    if (tx.type !== "NHAP") {
-      recordSaleDaily(ss, tx);
-    }
-
-    // Ghi nhận vào Sheet 'HeThongDebug' để theo dõi kiểm tra hệ thống
-    const eventName = tx.type === "NHAP" ? "GIAO DỊCH NHẬP" : "GIAO DỊCH BÁN";
-    const noteMsg = "Đã lưu " + (tx.type === "NHAP" ? "nhập" : "bán") + " " + tx.quantity + " " + (tx.unit || "cái") + " " + tx.productName;
-    logDebug(ss, eventName, "THÀNH CÔNG", JSON.stringify(tx), noteMsg);
-
-    // (Tùy chọn) Gửi tin nhắn Telegram từ GAS nếu có điền Token
-    if (TELEGRAM_CONFIG.BOT_TOKEN && TELEGRAM_CONFIG.CHAT_ID) {
-      sendTelegramFromGAS(tx);
-    }
-
-    return ContentService.createTextOutput(JSON.stringify({
+    return jsonOut({
       status: "success",
-      message: "Đã lưu giao dịch và cập nhật tồn kho thành công!",
-      transactionId: tx.id
-    })).setMimeType(ContentService.MimeType.JSON);
-
+      message: "Đã lưu " + txs.length + " giao dịch và cập nhật các sheet thành công!",
+      transactionIds: txs.map((t) => t.id)
+    });
   } catch (error) {
-    if (ss) {
-      logDebug(ss, "LỖI HỆ THỐNG", "THẤT BẠI", rawContent, error.toString());
-    }
-    return ContentService.createTextOutput(JSON.stringify({
-      status: "error",
-      message: error.toString()
-    })).setMimeType(ContentService.MimeType.JSON);
+    if (ss) logDebug(ss, "LỖI HỆ THỐNG", "THẤT BẠI", rawContent, error.toString());
+    return jsonOut({ status: "error", message: error.toString() });
   } finally {
-    lock.releaseLock();
+    try {
+      lock.releaseLock();
+    } catch (err) {
+      // bỏ qua
+    }
   }
 }
 
-/**
- * Ghi log vào Sheet 'HeThongDebug' để kiểm tra và khắc phục sự cố hệ thống
- */
+/* ------------------------------------------------------------------ */
+/*  Ghi một lệnh (có thể nhiều mặt hàng) và đồng bộ tất cả các sheet     */
+/* ------------------------------------------------------------------ */
+
+// Ghi một dòng vào LichSuGiaoDich, trả về thông tin để dựng tin nhắn
+function appendTransactionRow(hist, tx, catalog) {
+  const isBan = tx.type !== "NHAP";
+  const when = tx.timestamp ? new Date(tx.timestamp) : new Date();
+  const d = isNaN(when.getTime()) ? new Date() : when;
+  const fullTime = tx.formattedTime || Utilities.formatDate(d, TZ, "HH:mm:ss dd/MM/yyyy");
+
+  const qty = Number(tx.quantity) || 0;
+  const rawName = String(tx.productName || "").trim();
+  const item = findCatalogItem(rawName, catalog);
+
+  const key = item ? item.code : rawName;
+  const displayName = item ? item.name : rawName;
+  const unit = String(tx.unit || (item ? item.unit : "") || "cái");
+
+  // Giá: ưu tiên giá app gửi lên; nếu không có thì lấy từ DanhMuc
+  let unitPrice = Number(tx.unitPrice) || 0;
+  if (!unitPrice && item) unitPrice = isBan ? item.sellPrice : item.importPrice;
+  const total = Number(tx.totalPrice) || Math.round(unitPrice * qty);
+
+  let profit = "";
+  if (isBan && item && unitPrice > 0) profit = total - qty * item.importPrice;
+
+  const row = appendByHeader(hist, {
+    "Mã GD": tx.id || "",
+    "Mã Lô": tx.batchId || tx.id || "",
+    "Ngày": dayOf(d),
+    "Thời Gian": fullTime,
+    "Loại": isBan ? "BÁN HÀNG" : "NHẬP HÀNG",
+    "Mã SP": key,
+    "Tên Sản Phẩm": displayName,
+    "Số Lượng": qty,
+    "Đơn Vị": unit,
+    "Đơn Giá (VNĐ)": unitPrice,
+    "Thành Tiền (VNĐ)": total,
+    "Lợi Nhuận (VNĐ)": profit,
+    "Câu Thoại Gốc": tx.rawTranscript || ""
+  });
+  formatCells(hist, row, {
+    "Ngày": "dd/MM/yyyy",
+    "Đơn Giá (VNĐ)": "#,##0",
+    "Thành Tiền (VNĐ)": "#,##0",
+    "Lợi Nhuận (VNĐ)": "#,##0"
+  });
+
+  return {
+    isBan: isBan,
+    key: key,
+    name: displayName,
+    qty: qty,
+    unit: unit,
+    unitPrice: unitPrice,
+    total: total,
+    inCatalog: !!item,
+    time: fullTime,
+    raw: tx.rawTranscript || "",
+    id: tx.id || ""
+  };
+}
+
+// Ghi cả một lệnh: mọi mặt hàng trong lệnh được ghi trước, rồi tính lại các sheet một lần,
+// rồi gửi MỘT tin Telegram tổng hợp cho cả lệnh.
+function saveBatch(ss, txs, rawContent, tgCfg) {
+  ensureSheet(ss, SHEET.CATALOG, HEADERS.DanhMuc);
+  const hist = ensureSheet(ss, SHEET.HISTORY, HEADERS.LichSu);
+  ensureLogSheet(ss, SHEET.DEBUG, HEADERS.HeThongDebug);
+
+  const catalog = getCatalog(ss);
+  migrateHistory(hist, catalog);
+
+  const rows = txs.map((tx) => appendTransactionRow(hist, tx, catalog));
+  const stockByKey = syncDerivedSheets(ss, hist, catalog);
+
+  rows.forEach((r) => {
+    let note = (r.isBan ? "Đã lưu bán " : "Đã lưu nhập ") + r.qty + " " + r.unit + " " + r.name;
+    if (!r.inCatalog) note += " (chưa có trong DanhMuc nên chưa tính được giá)";
+    else if (r.isBan && r.unitPrice === 0) note += " (giá 0 trong DanhMuc)";
+    logDebug(ss, r.isBan ? "GIAO DỊCH BÁN" : "GIAO DỊCH NHẬP", "THÀNH CÔNG", rawContent, note);
+  });
+
+  const tgToken = TELEGRAM_CONFIG.BOT_TOKEN || (tgCfg && tgCfg.botToken) || "";
+  const tgChat = TELEGRAM_CONFIG.CHAT_ID || (tgCfg && tgCfg.chatId) || "";
+  if (tgToken && tgChat && rows.length > 0) {
+    sendTelegramHtml(tgToken, tgChat, buildTelegramBatchHtml(rows, stockByKey, rows[0].raw));
+  }
+}
+
+// Tính lại BanHangNgay, TonKho, Dashboard từ LichSuGiaoDich. Trả về tồn kho theo khoá sản phẩm.
+function syncDerivedSheets(ss, hist, catalog) {
+  const histRows = readObjects(hist);
+  rebuildSales(ss, histRows);
+  const st = rebuildStock(ss, histRows, catalog);
+  rebuildDashboard(ss, hist, st.alerts);
+  return st.byKey;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Chạy một lần từ trình soạn thảo: tạo đủ sheet và báo cáo              */
+/* ------------------------------------------------------------------ */
+
+function setupAllSheets() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  ensureSheet(ss, SHEET.CATALOG, HEADERS.DanhMuc);
+  const hist = ensureSheet(ss, SHEET.HISTORY, HEADERS.LichSu);
+  ensureLogSheet(ss, SHEET.DEBUG, HEADERS.HeThongDebug);
+  const catalog = getCatalog(ss);
+  migrateHistory(hist, catalog);
+  syncDerivedSheets(ss, hist, catalog);
+  Logger.log("Đã tạo/cập nhật các sheet. Danh mục: " + catalog.length + " sản phẩm.");
+}
+
+/* ------------------------------------------------------------------ */
+/*  Nhật ký debug                                                      */
+/* ------------------------------------------------------------------ */
+
 function logDebug(ss, eventType, status, payloadStr, noteStr) {
   try {
-    const debugSheet = getOrCreateSheet(ss, "HeThongDebug", [
-      "Thời Gian", "Sự Kiện / Hành Động", "Trạng Thái", "Dữ Liệu Nhận Được (Payload)", "Chi Tiết / Thông Báo Lỗi"
-    ], ["#334155", "#475569"]);
-
-    const timeStr = Utilities.formatDate(new Date(), "Asia/Ho_Chi_Minh", "HH:mm:ss dd/MM/yyyy");
-    debugSheet.appendRow([
-      timeStr,
-      eventType,
-      status,
-      payloadStr ? String(payloadStr).slice(0, 1000) : "",
-      noteStr || ""
-    ]);
-
-    // Định dạng màu cho cột Trạng Thái
-    const lastRow = debugSheet.getLastRow();
-    const statusCell = debugSheet.getRange(lastRow, 3);
+    const sh = ensureLogSheet(ss, SHEET.DEBUG, HEADERS.HeThongDebug);
+    const timeStr = Utilities.formatDate(new Date(), TZ, "HH:mm:ss dd/MM/yyyy");
+    const row = appendByHeader(sh, {
+      "Thời Gian": timeStr,
+      "Sự Kiện / Hành Động": eventType,
+      "Trạng Thái": status,
+      "Dữ Liệu Nhận Được (Payload)": payloadStr ? String(payloadStr).slice(0, 1000) : "",
+      "Chi Tiết / Thông Báo Lỗi": noteStr || ""
+    });
+    const statusCell = sh.getRange(row, headerMap(sh)["Trạng Thái"]);
     if (status === "THÀNH CÔNG") {
       statusCell.setFontColor("#059669").setFontWeight("bold");
     } else {
@@ -182,234 +763,101 @@ function logDebug(ss, eventType, status, payloadStr, noteStr) {
   }
 }
 
-/**
- * Tìm hoặc tạo mới Sheet nếu chưa tồn tại, có kẻ viền và tô màu tiêu đề
- */
-function getOrCreateSheet(ss, sheetName, headers, headerColors) {
-  let sheet = ss.getSheetByName(sheetName);
-  if (!sheet) {
-    sheet = ss.insertSheet(sheetName);
-    
-    // Thêm dòng tiêu đề
-    sheet.appendRow(headers);
-    const headerRange = sheet.getRange(1, 1, 1, headers.length);
-    headerRange.setFontWeight("bold");
-    headerRange.setFontColor("#FFFFFF");
-    headerRange.setBackground(headerColors[0]);
-    headerRange.setHorizontalAlignment("center");
-    headerRange.setVerticalAlignment("middle");
-    sheet.setRowHeight(1, 35);
-    sheet.setFrozenRows(1);
-    
-    sheet.autoResizeColumns(1, headers.length);
-  }
-  return sheet;
+/* ------------------------------------------------------------------ */
+/*  Telegram: MỘT tin cho cả lệnh, mỗi mặt hàng một dòng, tồn kho từ sheet */
+/* ------------------------------------------------------------------ */
+
+function escHtml(v) {
+  return String(v === null || v === undefined ? "" : v)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
-/**
- * Cập nhật bảng TonKho: nếu tồn tại thì cộng dồn, chưa thì thêm mới
- */
-function updateInventory(sheet, tx) {
-  const data = sheet.getDataRange().getValues();
-  const prodName = (tx.productName || "").trim().toLowerCase();
-  const unit = (tx.unit || "cái").trim().toLowerCase();
-  const qty = Number(tx.quantity) || 0;
-  const isNhap = tx.type === "NHAP";
-  const nowStr = Utilities.formatDate(new Date(), "Asia/Ho_Chi_Minh", "HH:mm:ss dd/MM/yyyy");
-
-  let foundRow = -1;
-
-  for (let i = 1; i < data.length; i++) {
-    const rowProd = String(data[i][0]).trim().toLowerCase();
-    const rowUnit = String(data[i][1]).trim().toLowerCase();
-    if (rowProd === prodName && rowUnit === unit) {
-      foundRow = i + 1; // 1-indexed trong Sheets
-      break;
-    }
-  }
-
-  if (foundRow > 0) {
-    let curImport = Number(sheet.getRange(foundRow, 3).getValue()) || 0;
-    let curExport = Number(sheet.getRange(foundRow, 4).getValue()) || 0;
-
-    if (isNhap) {
-      curImport += qty;
-    } else {
-      curExport += qty;
-    }
-
-    const curStock = curImport - curExport;
-
-    sheet.getRange(foundRow, 3).setValue(curImport);
-    sheet.getRange(foundRow, 4).setValue(curExport);
-    sheet.getRange(foundRow, 5).setValue(curStock);
-    sheet.getRange(foundRow, 6).setValue(nowStr);
-
-    const stockCell = sheet.getRange(foundRow, 5);
-    if (curStock <= 0) {
-      stockCell.setFontColor("#DC2626").setFontWeight("bold");
-    } else if (curStock <= 5) {
-      stockCell.setFontColor("#D97706").setFontWeight("bold");
-    } else {
-      stockCell.setFontColor("#059669").setFontWeight("bold");
-    }
-
-  } else {
-    const importQty = isNhap ? qty : 0;
-    const exportQty = isNhap ? 0 : qty;
-    const stockQty = importQty - exportQty;
-
-    sheet.appendRow([
-      tx.productName,
-      tx.unit || "cái",
-      importQty,
-      exportQty,
-      stockQty,
-      nowStr
-    ]);
-
-    const newRow = sheet.getLastRow();
-    const stockCell = sheet.getRange(newRow, 5);
-    if (stockQty <= 0) {
-      stockCell.setFontColor("#DC2626").setFontWeight("bold");
-    } else {
-      stockCell.setFontColor("#059669").setFontWeight("bold");
-    }
-  }
+// 25000 -> "25.000 đ"
+function fmtVnd(n) {
+  return String(Math.round(Number(n) || 0)).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ".") + " đ";
 }
 
-/**
- * Ghi mỗi mặt hàng bán vào sheet 'BanHangNgay' (có bộ lọc) và đảm bảo có sheet 'Dashboard'
- */
-function recordSaleDaily(ss, tx) {
-  const salesSheet = getOrCreateSheet(ss, "BanHangNgay", [
-    "Ngày", "Giờ", "Mã Lô", "Mặt Hàng", "Số Lượng", "Đơn Vị", "Đơn Giá (VNĐ)", "Thành Tiền (VNĐ)", "Mã GD"
-  ], ["#7C2D12", "#9A3412"]);
+function fmtNum(n) {
+  return String(Math.round(Number(n) || 0)).replace(/\\B(?=(\\d{3})+(?!\\d))/g, ".");
+}
 
-  // Bộ lọc trên toàn bộ cột (tạo một lần)
-  if (!salesSheet.getFilter()) {
-    salesSheet.getRange(1, 1, salesSheet.getMaxRows(), 9).createFilter();
+function padR(s, n) {
+  const t = String(s);
+  return t.length >= n ? t.slice(0, n) : t + " ".repeat(n - t.length);
+}
+
+function padL(s, n) {
+  const t = String(s);
+  return t.length >= n ? t : " ".repeat(n - t.length) + t;
+}
+
+// Một tin cho cả lệnh: bảng mặt hàng, bảng tồn kho sau lệnh, tổng tiền.
+// Cột canh đều trong <pre> (tổng độ rộng 40 ký tự để vừa màn hình điện thoại).
+function buildTelegramBatchHtml(rows, stockByKey, raw) {
+  const NAME_W = 17;
+  const sales = rows.filter((r) => r.isBan);
+  const imports = rows.filter((r) => !r.isBan);
+
+  let title;
+  if (sales.length > 0 && imports.length === 0) title = "🔴 <b>BÁN HÀNG</b>";
+  else if (imports.length > 0 && sales.length === 0) title = "🟢 <b>NHẬP KHO</b>";
+  else title = "🔵 <b>GIAO DỊCH KHO</b>";
+
+  let s = title + " · " + rows.length + " mặt hàng\\n\\n";
+
+  const table = [padR("Mặt hàng", NAME_W) + " " + padL("SL", 3) + " " + padL("Đơn giá", 8) + " " + padL("Tiền", 9)];
+  rows.forEach((r) => {
+    table.push(
+      padR(r.name, NAME_W) + " " +
+      padL(r.qty, 3) + " " +
+      padL(r.unitPrice > 0 ? fmtNum(r.unitPrice) : "—", 8) + " " +
+      padL(r.total > 0 ? fmtNum(r.total) : "—", 9)
+    );
+  });
+  s += "<pre>" + escHtml(table.join("\\n")) + "</pre>\\n";
+
+  const saleTotal = sales.reduce((acc, r) => acc + (r.total || 0), 0);
+  const importTotal = imports.reduce((acc, r) => acc + (r.total || 0), 0);
+  if (saleTotal > 0) s += "💰 <b>Tổng tiền bán:</b> " + fmtVnd(saleTotal) + "\\n";
+  if (importTotal > 0) s += "📥 <b>Tổng tiền nhập:</b> " + fmtVnd(importTotal) + "\\n";
+
+  const seen = {};
+  const stockRows = [];
+  rows.forEach((r) => {
+    if (seen[r.key] || !Object.prototype.hasOwnProperty.call(stockByKey, r.key)) return;
+    seen[r.key] = true;
+    const cur = stockByKey[r.key];
+    let status;
+    if (!r.inCatalog) status = "chưa có DM";
+    else if (cur < 0) status = "ÂM";
+    else if (cur === 0) status = "hết";
+    else if (cur <= 5) status = "sắp hết";
+    else status = "đủ";
+    stockRows.push(padR(r.name, NAME_W) + " " + padL(cur + " " + r.unit, 11) + "  " + status);
+  });
+  if (stockRows.length > 0) {
+    s += "\\n📊 <b>Tồn kho sau lệnh</b>\\n<pre>" + escHtml(stockRows.join("\\n")) + "</pre>\\n";
   }
 
-  const now = tx.timestamp ? new Date(tx.timestamp) : new Date();
-  const parts = Utilities.formatDate(now, "Asia/Ho_Chi_Minh", "yyyy-MM-dd-HH-mm").split("-");
-  // Ngày lưu dạng ngày thuần (00:00) để SUMIFS/QUERY so khớp chính xác
-  const dayDate = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]));
-  const hm = parts[3] + ":" + parts[4];
-
-  const qty = Number(tx.quantity) || 0;
-  const unitPrice = Number(tx.unitPrice) || 0;
-  const total = Number(tx.totalPrice) || Math.round(unitPrice * qty);
-
-  salesSheet.appendRow([
-    dayDate,
-    hm,
-    tx.batchId || tx.id || "",
-    tx.productName,
-    qty,
-    tx.unit || "cái",
-    unitPrice,
-    total,
-    tx.id || ""
-  ]);
-
-  const last = salesSheet.getLastRow();
-  salesSheet.getRange(last, 1).setNumberFormat("dd/MM/yyyy");
-  salesSheet.getRange(last, 7, 1, 2).setNumberFormat("#,##0");
-
-  ensureDashboard(ss);
+  s += "\\n⏰ " + escHtml(rows[0].time) + "\\n";
+  s += "🗣️ <i>\\"" + escHtml(raw) + "\\"</i>\\n\\n";
+  s += "⚡ <i>VoiceStock · Quản lý tồn kho tức thì</i>";
+  return s;
 }
 
-/**
- * Tạo sheet 'Dashboard' (nếu chưa có): chọn ngày ở ô B3 để xem doanh thu và chi tiết mặt hàng
- */
-function ensureDashboard(ss) {
-  if (ss.getSheetByName("Dashboard")) return;
-
-  const dash = ss.insertSheet("Dashboard");
-
-  dash.getRange("A1:F1").merge()
-    .setValue("DASHBOARD BÁN HÀNG")
-    .setFontSize(16).setFontWeight("bold").setFontColor("#FFFFFF")
-    .setBackground("#7C2D12").setHorizontalAlignment("center");
-  dash.getRange("A2").setValue("Đổi ô B3 sang ngày khác để xem báo cáo của ngày đó.").setFontColor("#64748B").setFontStyle("italic");
-
-  dash.getRange("A3").setValue("Ngày xem:").setFontWeight("bold");
-  dash.getRange("B3").setFormula("=TODAY()").setNumberFormat("dd/MM/yyyy").setBackground("#FEF3C7").setFontWeight("bold");
-
-  dash.getRange("A5:A8").setValues([
-    ["Số dòng bán trong ngày"],
-    ["Tổng số lượng bán trong ngày"],
-    ["Doanh thu trong ngày (VNĐ)"],
-    ["Doanh thu toàn bộ (VNĐ)"]
-  ]);
-  dash.getRange("B5").setFormula('=COUNTIFS(BanHangNgay!A2:A,B3)');
-  dash.getRange("B6").setFormula('=SUMIFS(BanHangNgay!E2:E,BanHangNgay!A2:A,B3)');
-  dash.getRange("B7").setFormula('=SUMIFS(BanHangNgay!H2:H,BanHangNgay!A2:A,B3)');
-  dash.getRange("B8").setFormula('=SUM(BanHangNgay!H2:H)');
-  dash.getRange("B5:B8").setFontWeight("bold").setFontColor("#0F766E");
-  dash.getRange("B7:B8").setNumberFormat("#,##0");
-
-  dash.getRange("A10").setValue("Chi tiết theo mặt hàng (ngày đã chọn)").setFontWeight("bold");
-  dash.getRange("E10").setValue("Doanh thu theo ngày").setFontWeight("bold");
-  dash.getRange("A11:C11").setValues([["Mặt hàng", "Số lượng", "Doanh thu (VNĐ)"]]);
-  dash.getRange("E11:F11").setValues([["Ngày", "Doanh thu (VNĐ)"]]);
-  const hdr = dash.getRange("A11:F11");
-  hdr.setFontWeight("bold").setFontColor("#FFFFFF").setBackground("#334155");
-
-  // Mảng động: tự cập nhật khi có dòng bán mới
-  dash.getRange("A12").setFormula('=IFERROR(SORT(UNIQUE(FILTER(BanHangNgay!D2:D,BanHangNgay!A2:A=B3,BanHangNgay!D2:D<>"")),1,TRUE),"")');
-  dash.getRange("B12").setFormula('=IF(A12="","",ARRAYFORMULA(SUMIFS(BanHangNgay!E2:E,BanHangNgay!D2:D,A12:A,BanHangNgay!A2:A,B3)))');
-  dash.getRange("C12").setFormula('=IF(A12="","",ARRAYFORMULA(SUMIFS(BanHangNgay!H2:H,BanHangNgay!D2:D,A12:A,BanHangNgay!A2:A,B3)))');
-  dash.getRange("E12").setFormula('=IFERROR(SORT(UNIQUE(FILTER(BanHangNgay!A2:A,BanHangNgay!A2:A<>"")),1,FALSE),"")');
-  dash.getRange("F12").setFormula('=IF(E12="","",ARRAYFORMULA(SUMIFS(BanHangNgay!H2:H,BanHangNgay!A2:A,E12:E)))');
-
-  dash.getRange("C12:C1000").setNumberFormat("#,##0");
-  dash.getRange("F12:F1000").setNumberFormat("#,##0");
-  dash.getRange("E12:E1000").setNumberFormat("dd/MM/yyyy");
-  dash.setColumnWidth(1, 240);
-  dash.setColumnWidth(2, 120);
-  dash.setColumnWidth(3, 150);
-  dash.setColumnWidth(5, 120);
-  dash.setColumnWidth(6, 150);
-  dash.setHiddenGridlines(true);
-}
-
-/**
- * Gửi thông báo Telegram trực tiếp từ GAS
- */
-function sendTelegramFromGAS(tx) {
+function sendTelegramHtml(token, chatId, text) {
   try {
-    const isNhap = tx.type === "NHAP";
-    const title = isNhap ? "🟢 *[NHẬP KHO THÀNH CÔNG]*" : "🔴 *[BÁN HÀNG THÀNH CÔNG]*";
-    const actionText = isNhap ? "Nhập vào" : "Bán ra";
-    
-    let text = title + "\\n\\n" +
-      "📦 *Sản phẩm:* " + tx.productName + "\\n" +
-      "🔢 *" + actionText + ":* " + tx.quantity + " " + (tx.unit || "cái") + "\\n";
-      
-    if (tx.unitPrice) {
-      text += "💵 *Đơn giá:* " + tx.unitPrice + " đ\\n";
-      text += "💰 *Tổng tiền:* " + (tx.totalPrice || 0) + " đ\\n";
-    }
-    
-    text += "⏰ *Thời gian:* " + (tx.formattedTime || "") + "\\n" +
-      "🗣️ *Lệnh thoại:* _\\"" + (tx.rawTranscript || "") + "\\"_";
-
-    const payload = {
-      chat_id: TELEGRAM_CONFIG.CHAT_ID,
-      text: text,
-      parse_mode: "Markdown"
-    };
-
-    const options = {
+    const res = UrlFetchApp.fetch("https://api.telegram.org/bot" + token + "/sendMessage", {
       method: "post",
       contentType: "application/json",
-      payload: JSON.stringify(payload),
+      payload: JSON.stringify({ chat_id: chatId, text: text, parse_mode: "HTML" }),
       muteHttpExceptions: true
-    };
-
-    UrlFetchApp.fetch("https://api.telegram.org/bot" + TELEGRAM_CONFIG.BOT_TOKEN + "/sendMessage", options);
+    });
+    if (res.getResponseCode() !== 200) {
+      Logger.log("Telegram trả về lỗi: " + res.getContentText());
+    }
   } catch (err) {
     Logger.log("Lỗi gửi Telegram từ GAS: " + err);
   }
