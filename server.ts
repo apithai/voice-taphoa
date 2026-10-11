@@ -75,6 +75,48 @@ async function startServer() {
   app.use(cors());
   app.use(express.json({ limit: '10mb' }));
 
+  // Proxy Telegram ở phía máy chủ để trình duyệt không gọi trực tiếp Telegram Bot API (tránh CORS).
+  // Không ghi Bot Token vào log hoặc lưu xuống store.json.
+  app.post('/api/telegram/send', async (req, res) => {
+    const botToken = typeof req.body?.botToken === 'string' ? req.body.botToken.trim() : '';
+    const chatId = typeof req.body?.chatId === 'string' ? req.body.chatId.trim() : '';
+    const messageText = typeof req.body?.text === 'string' ? req.body.text : '';
+
+    if (!botToken || !chatId || !messageText) {
+      return res.status(400).json({
+        success: false,
+        message: 'Thiếu Bot Token, Chat ID hoặc nội dung tin nhắn.',
+      });
+    }
+
+    try {
+      const telegramRes = await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: chatId, text: messageText, parse_mode: 'HTML' }),
+      });
+      const telegramData = await telegramRes.json() as {
+        ok?: boolean;
+        description?: string;
+      };
+
+      if (!telegramRes.ok || !telegramData.ok) {
+        return res.status(502).json({
+          success: false,
+          message: telegramData.description || `Telegram trả về HTTP ${telegramRes.status}.`,
+        });
+      }
+
+      return res.json({ success: true, message: 'Telegram đã nhận tin nhắn thành công.' });
+    } catch (error) {
+      console.error('Lỗi máy chủ khi gọi Telegram Bot API.');
+      return res.status(502).json({
+        success: false,
+        message: `Máy chủ không kết nối được Telegram: ${(error as Error).message}`,
+      });
+    }
+  });
+
   // API ĐỒNG BỘ DỮ LIỆU ĐA THIẾT BỊ (MÁY TÍNH & ĐIỆN THOẠI)
   app.get('/api/sync', (_req, res) => {
     res.json({

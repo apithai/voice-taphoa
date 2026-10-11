@@ -277,7 +277,8 @@ export async function testGoogleSheetsConnection(
 }
 
 /**
- * Gửi thông báo đến Telegram Bot qua Telegram Bot API
+ * Gửi Telegram qua máy chủ cùng nguồn để tránh CORS khi gọi Telegram Bot API từ trình duyệt.
+ * Bot Token không được ghi log hoặc lưu trên máy chủ.
  */
 export async function sendTelegramMessage(
   botToken: string,
@@ -288,35 +289,29 @@ export async function sendTelegramMessage(
     return { success: false, message: 'Chưa cấu hình Telegram Bot Token hoặc Chat ID.' };
   }
 
-  const cleanToken = botToken.trim();
-  const cleanChatId = chatId.trim();
-  const url = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
-
   try {
-    const res = await fetch(url, {
+    const res = await fetch('/api/telegram/send', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
       body: JSON.stringify({
-        chat_id: cleanChatId,
-        text: text,
-        parse_mode: 'HTML',
+        botToken: botToken.trim(),
+        chatId: chatId.trim(),
+        text,
       }),
     });
-
     const data = await res.json();
-    if (data.ok) {
-      return { success: true, message: 'Đã gửi thông báo Telegram thành công!' };
-    } else {
+    if (!res.ok || !data.success) {
       return {
         success: false,
-        message: `Telegram báo lỗi: ${data.description || 'Không xác định'}`,
+        message: data.message || `Máy chủ Telegram trả về HTTP ${res.status}.`,
       };
     }
+    return { success: true, message: data.message || 'Đã gửi thông báo Telegram thành công!' };
   } catch (error) {
-    console.error('Lỗi gửi Telegram:', error);
+    console.error('Lỗi gửi Telegram qua máy chủ:', error);
     return {
       success: false,
-      message: `Lỗi mạng khi gọi Telegram Bot: ${(error as Error).message}`,
+      message: `Không kết nối được máy chủ gửi Telegram: ${(error as Error).message}`,
     };
   }
 }

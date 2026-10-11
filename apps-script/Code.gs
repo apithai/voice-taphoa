@@ -525,7 +525,10 @@ function rebuildDashboard(ss, hist, alerts, checks, productNames) {
     ["Lợi nhuận toàn bộ (VNĐ)", "=SUMIFS(" + PROFIT + "," + TYPE + "," + BAN + ")"],
     ["Mặt hàng cần chú ý (xem cảnh báo bên phải)", alerts.length]
   ];
-  sh.getRange(7, 1, kpi.length, 2).setFormulas(kpi);
+  // Labels and formulas are written separately; B15 is a numeric alert count, not a formula.
+  sh.getRange(7, 1, kpi.length, 1).setValues(kpi.map((row) => [row[0]]));
+  sh.getRange(7, 2, 8, 1).setFormulas(kpi.slice(0, 8).map((row) => [row[1]]));
+  sh.getRange("B15").setValue(alerts.length);
   sh.getRange("B7:B15").setNumberFormat("#,##0").setFontWeight("bold").setFontColor("#0F766E");
 
   // Chi tiết theo mặt hàng trong kỳ đã chọn
