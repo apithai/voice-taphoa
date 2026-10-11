@@ -138,37 +138,39 @@ export async function syncBatchToGoogleSheets(
   transactions: Transaction[],
   telegram?: { botToken: string; chatId: string }
 ): Promise<{ success: boolean; message: string }> {
-  if (!webhookUrl || !webhookUrl.startsWith('http')) {
-    return { success: false, message: 'Chưa cấu hình URL Webhook Google Sheets.' };
+  if (!webhookUrl || !/^https:\/\//i.test(webhookUrl)) {
+    return { success: false, message: 'URL Webhook Google Sheets không hợp lệ.' };
   }
-  if (transactions.length === 0) {
+  if (!transactions.length) {
     return { success: false, message: 'Không có giao dịch để gửi.' };
   }
 
   const payload = {
     action: 'RECORD_BATCH',
     transactions: transactions.map(toSheetTransaction),
-    // Apps Script gửi Telegram kèm tồn kho lấy từ sheet (nếu có cấu hình)
-    telegram:
-      telegram && telegram.botToken && telegram.chatId
-        ? { botToken: telegram.botToken.trim(), chatId: telegram.chatId.trim() }
-        : null,
+    telegram: telegram?.botToken?.trim() && telegram?.chatId?.trim()
+      ? { botToken: telegram.botToken.trim(), chatId: telegram.chatId.trim() }
+      : null,
   };
 
   try {
-    // Apps Script trả CORS khác nhau tuỳ trình duyệt; no-cors đảm bảo request được gửi đi.
+    // Apps Script thường không trả CORS header cho web app. Gửi text/plain để tránh preflight.
+    // Vì no-cors tạo opaque response, tuyệt đối không báo rằng Sheet đã ghi thành công.
     await fetch(webhookUrl, {
       method: 'POST',
       mode: 'no-cors',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(payload),
     });
-    return { success: true, message: 'Đã gửi dữ liệu đồng bộ tới Google Sheets!' };
+    return {
+      success: false,
+      message: 'Đã gửi yêu cầu tới Google Sheets nhưng trình duyệt không thể xác minh kết quả. Hãy kiểm tra LichSuGiaoDich trước khi gửi lại; mã giao dịch giúp chống ghi trùng.',
+    };
   } catch (error) {
     console.error('Lỗi gửi tới Google Sheets:', error);
     return {
       success: false,
-      message: `Lỗi kết nối Google Sheets: ${(error as Error).message}`,
+      message: `Không gửi được yêu cầu tới Google Sheets: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
 }
@@ -236,10 +238,10 @@ export function buildTelegramBatchText(transactions: Transaction[]): string {
 export async function testGoogleSheetsConnection(
   webhookUrl: string
 ): Promise<{ success: boolean; message: string; duration?: number }> {
-  if (!webhookUrl || !webhookUrl.startsWith('http')) {
+  if (!webhookUrl || !/^https:\/\//i.test(webhookUrl)) {
     return {
       success: false,
-      message: 'URL Webhook Google Sheets không hợp lệ. URL phải bắt đầu bằng https://script.google.com/macros/s/...',
+      message: 'URL Webhook Google Sheets không hợp lệ. Hãy dùng URL Web App kết thúc bằng /exec.',
     };
   }
 
@@ -248,30 +250,27 @@ export async function testGoogleSheetsConnection(
     action: 'TEST_CONNECTION',
     clientTime: new Date().toISOString(),
     clientTimeFormatted: formatDateTime(new Date().toISOString()),
-    note: 'Kiểm tra kết nối và tạo sheet HeThongDebug từ Web App VoiceStock',
+    note: 'Kiểm tra kết nối từ VoiceStock',
   };
 
   try {
     await fetch(webhookUrl, {
       method: 'POST',
       mode: 'no-cors',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(testPayload),
     });
-
     const duration = Date.now() - startTime;
     return {
-      success: true,
+      success: false,
       duration,
-      message: `Kết nối thành công (${duration}ms)! Đã gửi tín hiệu kiểm tra và ghi nhật ký vào sheet 'HeThongDebug'.`,
+      message: `Đã gửi tín hiệu kiểm tra (${duration}ms), nhưng trình duyệt không cho đọc phản hồi. Hãy mở HeThongDebug trong Google Sheets để xác nhận; đây chưa phải bằng chứng kết nối thành công.`,
     };
   } catch (error) {
     console.error('Lỗi kiểm tra Google Sheets:', error);
     return {
       success: false,
-      message: `Không thể kết nối tới Google Sheets: ${(error as Error).message}`,
+      message: `Không gửi được yêu cầu tới Google Sheets: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
 }
