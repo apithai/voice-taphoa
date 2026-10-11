@@ -142,6 +142,61 @@ async function startServer() {
     }
   });
 
+  // API GỬI TIN NHẮN TELEGRAM (Tránh lỗi mạng / nhà mạng chặn / CORS trình duyệt)
+  app.post('/api/telegram/send', async (req, res) => {
+    try {
+      const { botToken, chatId, text } = req.body || {};
+      if (!botToken || !chatId || !text) {
+        return res.status(400).json({
+          success: false,
+          message: 'Vui lòng cung cấp đầy đủ botToken, chatId và text.',
+        });
+      }
+
+      let cleanToken = String(botToken).trim();
+      if (cleanToken.toLowerCase().startsWith('bot')) {
+        cleanToken = cleanToken.slice(3).trim();
+      }
+      const cleanChatId = String(chatId).trim();
+
+      const telegramUrl = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
+      const response = await fetch(telegramUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          chat_id: cleanChatId,
+          text: text,
+          parse_mode: 'HTML',
+        }),
+      });
+
+      const data = (await response.json()) as any;
+      if (data && data.ok) {
+        return res.json({
+          success: true,
+          message: 'Đã gửi thông báo Telegram thành công qua máy chủ!',
+        });
+      } else {
+        let errorMsg = data?.description || 'Không xác định';
+        if (errorMsg.includes('chat not found')) {
+          errorMsg = 'Chat ID không tồn tại hoặc bot chưa được thêm vào nhóm/chưa bấm /start.';
+        } else if (errorMsg.includes('Unauthorized')) {
+          errorMsg = 'Bot Token không hợp lệ. Vui lòng kiểm tra lại token từ @BotFather.';
+        }
+        return res.status(400).json({
+          success: false,
+          message: `Telegram báo lỗi: ${errorMsg}`,
+        });
+      }
+    } catch (err) {
+      console.error('Lỗi POST /api/telegram/send:', err);
+      return res.status(500).json({
+        success: false,
+        message: `Lỗi kết nối máy chủ tới Telegram: ${(err as Error).message}`,
+      });
+    }
+  });
+
   // Tình trạng kết nối máy chủ
   app.get('/api/health', (_req, res) => {
     res.json({ status: 'ok', time: new Date().toISOString(), updatedAt: storeCache.updatedAt });

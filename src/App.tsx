@@ -805,27 +805,33 @@ export default function App() {
       );
     }
 
-    // Đồng bộ Google Sheets (mỗi mặt hàng một dòng, cùng Mã Lô)
-    // Telegram: có webhook thì Apps Script gửi MỘT tin cho cả lệnh (tồn kho lấy từ sheet);
-    // không có webhook, hoặc không đẩy được lên sheet, thì app tự gửi một tin tổng hợp.
-    const tgCfg =
-      settings.telegramBotToken && settings.telegramChatId
-        ? { botToken: settings.telegramBotToken, chatId: settings.telegramChatId }
-        : undefined;
-
+    // 4. Đồng bộ Google Sheets (mỗi mặt hàng một dòng, cùng Mã Lô)
     if (settings.googleSheetsWebhook) {
       const ids = newTxs.map((t) => t.id);
-      syncBatchToGoogleSheets(settings.googleSheetsWebhook, newTxs, tgCfg).then((res) => {
+      syncBatchToGoogleSheets(settings.googleSheetsWebhook, newTxs).then((res) => {
         const nextStatus = res.success ? 'sent_unconfirmed' : 'failed';
         setHistory((prev) =>
           prev.map((x) => (ids.includes(x.id) ? { ...x, sheetsSyncStatus: nextStatus } : x))
         );
-        if (!res.success && tgCfg) {
-          sendTelegramMessage(tgCfg.botToken, tgCfg.chatId, buildTelegramBatchText(newTxs));
+      });
+    }
+
+    // 5. Gửi thông báo Telegram Bot trực tiếp
+    if (settings.telegramBotToken && settings.telegramChatId) {
+      const tgText =
+        newTxs.length > 1
+          ? buildTelegramBatchText(newTxs)
+          : buildTelegramTransactionText(newTxs[0], updatedItems[0]);
+      sendTelegramMessage(settings.telegramBotToken, settings.telegramChatId, tgText).then((res) => {
+        if (res.success) {
+          const ids = newTxs.map((t) => t.id);
+          setHistory((prev) =>
+            prev.map((x) => (ids.includes(x.id) ? { ...x, syncedTelegram: true } : x))
+          );
+        } else {
+          console.warn('Lỗi gửi Telegram:', res.message);
         }
       });
-    } else if (tgCfg) {
-      sendTelegramMessage(tgCfg.botToken, tgCfg.chatId, buildTelegramBatchText(newTxs));
     }
 
     // Thông báo và reset
@@ -1023,6 +1029,29 @@ export default function App() {
       showToast(`Đã gửi lại giao dịch ${tx.id} tới Google Sheets (chưa xác nhận)!`, 'info');
     } else {
       showToast(`Gửi lại thất bại: ${res.message}`, 'error');
+    }
+  };
+
+  // --- Gửi lại tới Telegram ---
+  const handleResendTelegram = async (tx: Transaction) => {
+    if (!settings.telegramBotToken || !settings.telegramChatId) {
+      showToast('Vui lòng nhập Bot Token và Chat ID trong Cài đặt trước.', 'error');
+      return;
+    }
+    const item = inventory.find(
+      (i) =>
+        i.productName.trim().toLowerCase() === tx.productName.trim().toLowerCase() &&
+        i.unit.trim().toLowerCase() === tx.unit.trim().toLowerCase()
+    );
+    const tgText = buildTelegramTransactionText(tx, item);
+    const res = await sendTelegramMessage(settings.telegramBotToken, settings.telegramChatId, tgText);
+    if (res.success) {
+      setHistory((prev) =>
+        prev.map((t) => (t.id === tx.id ? { ...t, syncedTelegram: true } : t))
+      );
+      showToast(`Đã gửi giao dịch ${tx.id} tới Telegram thành công!`, 'success');
+    } else {
+      showToast(`Gửi tới Telegram thất bại: ${res.message}`, 'error');
     }
   };
 
@@ -2098,6 +2127,19 @@ export default function App() {
                                   >
                                     <QrCode className="w-3.5 h-3.5" />
                                     <span>Hiện QR</span>
+                                  </button>
+                                )}
+                                {Boolean(settings.telegramBotToken && settings.telegramChatId) && (
+                                  <button
+                                    onClick={() => handleResendTelegram(tx)}
+                                    className={`p-1.5 rounded-lg border transition cursor-pointer ${
+                                      tx.syncedTelegram
+                                        ? 'bg-sky-500/15 border-sky-500/30 text-sky-300 hover:bg-sky-500/25'
+                                        : 'bg-slate-800 border-slate-700 text-slate-400 hover:text-sky-300 hover:bg-slate-700'
+                                    }`}
+                                    title={tx.syncedTelegram ? 'Đã gửi Telegram (bấm để gửi lại)' : 'Gửi thông báo tới Telegram'}
+                                  >
+                                    <Bot className="w-3.5 h-3.5" />
                                   </button>
                                 )}
                               <button

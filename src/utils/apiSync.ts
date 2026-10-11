@@ -277,7 +277,7 @@ export async function testGoogleSheetsConnection(
 }
 
 /**
- * Gửi thông báo đến Telegram Bot qua Telegram Bot API
+ * Gửi thông báo đến Telegram Bot (Ưu tiên qua máy chủ để tránh bị nhà mạng chặn / CORS, tự động dự phòng gọi trực tiếp)
  */
 export async function sendTelegramMessage(
   botToken: string,
@@ -288,10 +288,38 @@ export async function sendTelegramMessage(
     return { success: false, message: 'Chưa cấu hình Telegram Bot Token hoặc Chat ID.' };
   }
 
-  const cleanToken = botToken.trim();
+  let cleanToken = botToken.trim();
+  if (cleanToken.toLowerCase().startsWith('bot')) {
+    cleanToken = cleanToken.slice(3).trim();
+  }
   const cleanChatId = chatId.trim();
-  const url = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
 
+  // 1. Thử gửi qua endpoint proxy của máy chủ trước (tránh chặn CORS / chặn DNS nhà mạng VN)
+  try {
+    const proxyRes = await fetch('/api/telegram/send', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        botToken: cleanToken,
+        chatId: cleanChatId,
+        text,
+      }),
+    });
+
+    const proxyData = await proxyRes.json().catch(() => null);
+    if (proxyRes.ok && proxyData?.success) {
+      return { success: true, message: proxyData.message || 'Đã gửi thông báo Telegram thành công!' };
+    }
+    if (proxyData && proxyData.message && !proxyRes.ok) {
+      // Máy chủ phản hồi lỗi từ Telegram (sai token, sai chat ID, ...)
+      return { success: false, message: proxyData.message };
+    }
+  } catch (_err) {
+    // Nếu không kết nối được tới endpoint máy chủ (ví dụ chạy offline/file standalone), thử gọi trực tiếp bên dưới
+  }
+
+  // 2. Dự phòng: gọi trực tiếp Telegram Bot API
+  const url = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
   try {
     const res = await fetch(url, {
       method: 'POST',
@@ -307,9 +335,15 @@ export async function sendTelegramMessage(
     if (data.ok) {
       return { success: true, message: 'Đã gửi thông báo Telegram thành công!' };
     } else {
+      let desc = data.description || 'Không xác định';
+      if (desc.includes('chat not found')) {
+        desc = 'Chat ID không đúng hoặc bạn chưa mở tin nhắn với bot và bấm /start.';
+      } else if (desc.includes('Unauthorized')) {
+        desc = 'Bot Token không hợp lệ. Vui lòng kiểm tra lại token từ @BotFather.';
+      }
       return {
         success: false,
-        message: `Telegram báo lỗi: ${data.description || 'Không xác định'}`,
+        message: `Telegram báo lỗi: ${desc}`,
       };
     }
   } catch (error) {
@@ -322,12 +356,18 @@ export async function sendTelegramMessage(
 }
 
 /**
- * Soạn nội dung tin nhắn giao dịch đẹp mắt cho Telegram
+ * Soạn nội dung tin nhắn giao dịch đẹp mắt cho Telegram (có escape ký tự đặc biệt)
  */
 export function buildTelegramTransactionText(
   transaction: Transaction,
   stockItem?: InventoryItem
 ): string {
+  const esc = (v: unknown) =>
+    String(v ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;');
+
   const isNhap = transaction.type === 'NHAP';
   const badge = isNhap ? '🟢 <b>[NHẬP KHO THÀNH CÔNG]</b>' : '🔴 <b>[BÁN HÀNG THÀNH CÔNG]</b>';
   const actionText = isNhap ? 'Nhập vào' : 'Bán ra';
@@ -341,15 +381,15 @@ export function buildTelegramTransactionText(
   }
 
   const stockLine = stockItem
-    ? `\n📊 <b>Tồn kho hiện tại:</b> <code>${stockItem.currentStock} ${stockItem.unit}</code>`
+    ? `\n📊 <b>Tồn kho hiện tại:</b> <code>${stockItem.currentStock} ${esc(stockItem.unit)}</code>`
     : '';
 
   return `${badge}
 
-📦 <b>Sản phẩm:</b> ${transaction.productName}
-🔢 <b>${actionText}:</b> <b>${transaction.quantity} ${transaction.unit}</b>${priceLine}${stockLine}
-⏰ <b>Thời gian:</b> ${transaction.formattedTime}
-🗣️ <b>Lệnh thoại:</b> <i>"${transaction.rawTranscript}"</i>
+📦 <b>Sản phẩm:</b> ${esc(transaction.productName)}
+🔢 <b>${actionText}:</b> <b>${transaction.quantity} ${esc(transaction.unit)}</b>${priceLine}${stockLine}
+⏰ <b>Thời gian:</b> ${esc(transaction.formattedTime)}
+🗣️ <b>Lệnh thoại:</b> <i>"${esc(transaction.rawTranscript)}"</i>
 
 ⚡ <i>Hệ thống VoiceStock - Quản lý tồn kho tức thì</i>`;
 }
