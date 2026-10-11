@@ -138,37 +138,39 @@ export async function syncBatchToGoogleSheets(
   transactions: Transaction[],
   telegram?: { botToken: string; chatId: string }
 ): Promise<{ success: boolean; message: string }> {
-  if (!webhookUrl || !webhookUrl.startsWith('http')) {
-    return { success: false, message: 'Chưa cấu hình URL Webhook Google Sheets.' };
+  if (!webhookUrl || !/^https:\/\//i.test(webhookUrl)) {
+    return { success: false, message: 'URL Webhook Google Sheets không hợp lệ.' };
   }
-  if (transactions.length === 0) {
+  if (!transactions.length) {
     return { success: false, message: 'Không có giao dịch để gửi.' };
   }
 
   const payload = {
     action: 'RECORD_BATCH',
     transactions: transactions.map(toSheetTransaction),
-    // Apps Script gửi Telegram kèm tồn kho lấy từ sheet (nếu có cấu hình)
-    telegram:
-      telegram && telegram.botToken && telegram.chatId
-        ? { botToken: telegram.botToken.trim(), chatId: telegram.chatId.trim() }
-        : null,
+    telegram: telegram?.botToken?.trim() && telegram?.chatId?.trim()
+      ? { botToken: telegram.botToken.trim(), chatId: telegram.chatId.trim() }
+      : null,
   };
 
   try {
-    // Apps Script trả CORS khác nhau tuỳ trình duyệt; no-cors đảm bảo request được gửi đi.
+    // Apps Script thường không trả CORS header cho web app. Gửi text/plain để tránh preflight.
+    // Vì no-cors tạo opaque response, tuyệt đối không báo rằng Sheet đã ghi thành công.
     await fetch(webhookUrl, {
       method: 'POST',
       mode: 'no-cors',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(payload),
     });
-    return { success: true, message: 'Đã gửi dữ liệu đồng bộ tới Google Sheets!' };
+    return {
+      success: false,
+      message: 'Đã gửi yêu cầu tới Google Sheets nhưng trình duyệt không thể xác minh kết quả. Hãy kiểm tra LichSuGiaoDich trước khi gửi lại; mã giao dịch giúp chống ghi trùng.',
+    };
   } catch (error) {
     console.error('Lỗi gửi tới Google Sheets:', error);
     return {
       success: false,
-      message: `Lỗi kết nối Google Sheets: ${(error as Error).message}`,
+      message: `Không gửi được yêu cầu tới Google Sheets: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
 }
@@ -236,10 +238,10 @@ export function buildTelegramBatchText(transactions: Transaction[]): string {
 export async function testGoogleSheetsConnection(
   webhookUrl: string
 ): Promise<{ success: boolean; message: string; duration?: number }> {
-  if (!webhookUrl || !webhookUrl.startsWith('http')) {
+  if (!webhookUrl || !/^https:\/\//i.test(webhookUrl)) {
     return {
       success: false,
-      message: 'URL Webhook Google Sheets không hợp lệ. URL phải bắt đầu bằng https://script.google.com/macros/s/...',
+      message: 'URL Webhook Google Sheets không hợp lệ. Hãy dùng URL Web App kết thúc bằng /exec.',
     };
   }
 
@@ -248,30 +250,27 @@ export async function testGoogleSheetsConnection(
     action: 'TEST_CONNECTION',
     clientTime: new Date().toISOString(),
     clientTimeFormatted: formatDateTime(new Date().toISOString()),
-    note: 'Kiểm tra kết nối và tạo sheet HeThongDebug từ Web App VoiceStock',
+    note: 'Kiểm tra kết nối từ VoiceStock',
   };
 
   try {
     await fetch(webhookUrl, {
       method: 'POST',
       mode: 'no-cors',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'text/plain;charset=utf-8' },
       body: JSON.stringify(testPayload),
     });
-
     const duration = Date.now() - startTime;
     return {
-      success: true,
+      success: false,
       duration,
-      message: `Kết nối thành công (${duration}ms)! Đã gửi tín hiệu kiểm tra và ghi nhật ký vào sheet 'HeThongDebug'.`,
+      message: `Đã gửi tín hiệu kiểm tra (${duration}ms), nhưng trình duyệt không cho đọc phản hồi. Hãy mở HeThongDebug trong Google Sheets để xác nhận; đây chưa phải bằng chứng kết nối thành công.`,
     };
   } catch (error) {
     console.error('Lỗi kiểm tra Google Sheets:', error);
     return {
       success: false,
-      message: `Không thể kết nối tới Google Sheets: ${(error as Error).message}`,
+      message: `Không gửi được yêu cầu tới Google Sheets: ${error instanceof Error ? error.message : String(error)}`,
     };
   }
 }
@@ -284,73 +283,34 @@ export async function sendTelegramMessage(
   chatId: string,
   text: string
 ): Promise<{ success: boolean; message: string }> {
-  if (!botToken || !chatId) {
+  if (!botToken?.trim() || !chatId?.trim()) {
     return { success: false, message: 'Chưa cấu hình Telegram Bot Token hoặc Chat ID.' };
   }
 
-  let cleanToken = botToken.trim();
-  if (cleanToken.toLowerCase().startsWith('bot')) {
-    cleanToken = cleanToken.slice(3).trim();
-  }
+  const cleanToken = botToken.trim().replace(/^bot/i, '').trim();
   const cleanChatId = chatId.trim();
 
-  // 1. Thử gửi qua endpoint proxy của máy chủ trước (tránh chặn CORS / chặn DNS nhà mạng VN)
+  // Chỉ gửi qua server cùng nguồn. Gọi Telegram trực tiếp từ trình duyệt dễ gặp CORS
+  // và làm lộ Bot Token trong DevTools/network log.
   try {
-    const proxyRes = await fetch('/api/telegram/send', {
+    const response = await fetch('/api/telegram/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        botToken: cleanToken,
-        chatId: cleanChatId,
-        text,
-      }),
+      body: JSON.stringify({ botToken: cleanToken, chatId: cleanChatId, text }),
     });
-
-    const proxyData = await proxyRes.json().catch(() => null);
-    if (proxyRes.ok && proxyData?.success) {
-      return { success: true, message: proxyData.message || 'Đã gửi thông báo Telegram thành công!' };
+    const data = await response.json().catch(() => null);
+    if (response.ok && data?.success) {
+      return { success: true, message: data.message || 'Telegram đã xác nhận gửi thành công.' };
     }
-    if (proxyData && proxyData.message && !proxyRes.ok) {
-      // Máy chủ phản hồi lỗi từ Telegram (sai token, sai chat ID, ...)
-      return { success: false, message: proxyData.message };
-    }
-  } catch (_err) {
-    // Nếu không kết nối được tới endpoint máy chủ (ví dụ chạy offline/file standalone), thử gọi trực tiếp bên dưới
-  }
-
-  // 2. Dự phòng: gọi trực tiếp Telegram Bot API
-  const url = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: cleanChatId,
-        text: text,
-        parse_mode: 'HTML',
-      }),
-    });
-
-    const data = await res.json();
-    if (data.ok) {
-      return { success: true, message: 'Đã gửi thông báo Telegram thành công!' };
-    } else {
-      let desc = data.description || 'Không xác định';
-      if (desc.includes('chat not found')) {
-        desc = 'Chat ID không đúng hoặc bạn chưa mở tin nhắn với bot và bấm /start.';
-      } else if (desc.includes('Unauthorized')) {
-        desc = 'Bot Token không hợp lệ. Vui lòng kiểm tra lại token từ @BotFather.';
-      }
-      return {
-        success: false,
-        message: `Telegram báo lỗi: ${desc}`,
-      };
-    }
-  } catch (error) {
-    console.error('Lỗi gửi Telegram:', error);
     return {
       success: false,
-      message: `Lỗi mạng khi gọi Telegram Bot: ${(error as Error).message}`,
+      message: data?.message || `Máy chủ Telegram trả về HTTP ${response.status}. Kiểm tra server.ts và cấu hình bot.`,
+    };
+  } catch (error) {
+    console.error('Không gọi được endpoint Telegram cùng nguồn:', error);
+    return {
+      success: false,
+      message: 'Không kết nối được /api/telegram/send. Bản triển khai hiện tại chưa có server proxy hoạt động; không thử gọi Telegram trực tiếp từ trình duyệt vì dễ lỗi CORS và lộ Bot Token.',
     };
   }
 }
