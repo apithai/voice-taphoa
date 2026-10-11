@@ -1,5 +1,6 @@
 /**
  * Mã nguồn Google Apps Script (Code.gs) chuẩn cho Google Sheets
+ * Bản gốc để đọc/sửa: apps-script/Code.gs (file này được sinh lại từ đó)
  */
 export const GOOGLE_APPS_SCRIPT_CODE = `/**
  * ==============================================================================
@@ -7,13 +8,12 @@ export const GOOGLE_APPS_SCRIPT_CODE = `/**
  *
  * Các sheet:
  *  - DanhMuc        : danh mục sản phẩm, giá bán / giá nhập (sửa giá ở đây)
- *  - LichSuGiaoDich : nhật ký MỌI lần nhập / bán (nguồn dữ liệu gốc)
- *  - BanHangNgay    : các dòng BÁN, tính lại từ LichSuGiaoDich mỗi lần ghi
+ *  - LichSuGiaoDich : nhật ký MỌI lần nhập / bán (nguồn dữ liệu gốc, có bộ lọc Ngày/Tháng/Năm/Loại/Mặt hàng)
  *  - TonKho         : tính lại từ LichSuGiaoDich mỗi lần ghi
- *  - Dashboard      : báo cáo theo ngày chọn ở ô B3, tự cập nhật
+ *  - Dashboard      : báo cáo theo NGÀY / TUẦN / THÁNG / NĂM + lọc mặt hàng (ô B3, B4, B5)
  *  - HeThongDebug   : nhật ký kết nối và lỗi
  *
- * TonKho, BanHangNgay và Dashboard là sheet TỰ ĐỘNG: đừng nhập tay vào đó.
+ * TonKho và Dashboard là sheet TỰ ĐỘNG: đừng nhập tay vào đó.
  * Lần đầu, chọn hàm setupAllSheets ở thanh trên rồi bấm Chạy một lần.
  * ==============================================================================
  */
@@ -25,12 +25,10 @@ const TELEGRAM_CONFIG = {
 };
 
 const TZ = "Asia/Ho_Chi_Minh";
-const MAX_ROWS = 5000;
 
 const SHEET = {
   CATALOG: "DanhMuc",
   HISTORY: "LichSuGiaoDich",
-  SALES: "BanHangNgay",
   STOCK: "TonKho",
   DASH: "Dashboard",
   DEBUG: "HeThongDebug"
@@ -40,11 +38,8 @@ const HEADERS = {
   DanhMuc: ["Tên Sản Phẩm", "Đơn Vị", "Giá Bán (VNĐ)", "Giá Nhập (VNĐ)", "Tên Gọi Khác"],
   LichSu: [
     "Mã GD", "Mã Lô", "Ngày", "Thời Gian", "Loại", "Mã SP", "Tên Sản Phẩm",
-    "Số Lượng", "Đơn Vị", "Đơn Giá (VNĐ)", "Thành Tiền (VNĐ)", "Lợi Nhuận (VNĐ)", "Câu Thoại Gốc"
-  ],
-  BanHangNgay: [
-    "Ngày", "Giờ", "Mã Lô", "Mã SP", "Mặt Hàng", "Số Lượng", "Đơn Vị",
-    "Đơn Giá (VNĐ)", "Thành Tiền (VNĐ)", "Mã GD"
+    "Số Lượng", "Đơn Vị", "Đơn Giá (VNĐ)", "Thành Tiền (VNĐ)", "Lợi Nhuận (VNĐ)", "Câu Thoại Gốc",
+    "Tháng", "Năm"
   ],
   TonKho: [
     "Mã SP", "Tên Sản Phẩm", "Đơn Vị", "Tổng Nhập", "Tổng Bán",
@@ -104,6 +99,14 @@ function parseLegacyTime(s) {
   const m = String(s || "").match(/(\\d{1,2}):(\\d{2})(?::\\d{2})?\\s+(\\d{1,2})\\/(\\d{1,2})\\/(\\d{4})/);
   if (!m) return null;
   return new Date(Number(m[5]), Number(m[4]) - 1, Number(m[3]));
+}
+
+// Khoá ngày "yyyy-MM-dd" của một dòng lịch sử (cột Ngày là Date, hoặc đọc từ Thời Gian cũ)
+function dayKeyOf(o) {
+  let d = o["Ngày"];
+  if (!(d instanceof Date) || isNaN(d.getTime())) d = parseLegacyTime(o["Thời Gian"]);
+  if (!(d instanceof Date) || isNaN(d.getTime())) return "";
+  return Utilities.formatDate(d, TZ, "yyyy-MM-dd");
 }
 
 /* ------------------------------------------------------------------ */
@@ -301,6 +304,15 @@ function migrateHistory(sh, catalog) {
       if (d) setIf(row, "Ngày", d);
     }
 
+    // Tháng / Năm: để lọc và gom theo tháng, năm
+    {
+      const dd = row[idx("Ngày")] instanceof Date ? row[idx("Ngày")] : parseLegacyTime(row[idx("Thời Gian")]);
+      if (dd) {
+        setIf(row, "Tháng", Utilities.formatDate(dd, TZ, "yyyy-MM"));
+        setIf(row, "Năm", Number(Utilities.formatDate(dd, TZ, "yyyy")));
+      }
+    }
+
     // Mã SP: dòng cũ chỉ có tên
     if (!row[idx("Mã SP")]) {
       const name = String(row[idx("Tên Sản Phẩm")] || "").trim();
@@ -334,36 +346,6 @@ function migrateHistory(sh, catalog) {
   });
 
   if (changed) range.setValues(data);
-}
-
-/* ------------------------------------------------------------------ */
-/*  BanHangNgay: tính lại từ LichSuGiaoDich                              */
-/* ------------------------------------------------------------------ */
-
-function rebuildSales(ss, histRows) {
-  const sales = recreateSheet(ss, SHEET.SALES, HEADERS.BanHangNgay);
-  const rows = histRows
-    .filter((o) => o["Loại"] === "BÁN HÀNG")
-    .map((o) => [
-      o["Ngày"] || "",
-      String(o["Thời Gian"] || "").slice(0, 5),
-      o["Mã Lô"] || "",
-      o["Mã SP"] || "",
-      o["Tên Sản Phẩm"] || "",
-      Number(o["Số Lượng"]) || 0,
-      o["Đơn Vị"] || "",
-      parseMoney(o["Đơn Giá (VNĐ)"]),
-      parseMoney(o["Thành Tiền (VNĐ)"]),
-      o["Mã GD"] || ""
-    ]);
-
-  if (rows.length > 0) {
-    sales.getRange(2, 1, rows.length, HEADERS.BanHangNgay.length).setValues(rows);
-    sales.getRange(2, 1, rows.length, 1).setNumberFormat("dd/MM/yyyy");
-    sales.getRange(2, 8, rows.length, 2).setNumberFormat("#,##0");
-  }
-  sales.getRange(1, 1, 1000, HEADERS.BanHangNgay.length).createFilter();
-  sales.setColumnWidth(5, 240);
 }
 
 /* ------------------------------------------------------------------ */
@@ -416,6 +398,7 @@ function rebuildStock(ss, histRows, catalog) {
   sh.setColumnWidth(1, 170);
   sh.setColumnWidth(2, 260);
   sh.setColumnWidth(8, 220);
+  sh.getRange(1, 1, Math.max(out.length + 1, 2), HEADERS.TonKho.length).createFilter();
 
   const byKey = {};
   Object.keys(stock).forEach((k) => {
@@ -427,40 +410,81 @@ function rebuildStock(ss, histRows, catalog) {
 /* ------------------------------------------------------------------ */
 /*  Dashboard (công thức theo ngày chọn ở B3)                            */
 /* ------------------------------------------------------------------ */
+/*  Kiểm tra dữ liệu                                                    */
+/* ------------------------------------------------------------------ */
 
-function rebuildDashboard(ss, hist, alerts) {
-  // Giữ ngày người dùng đã chọn ở B3 (nếu là ô =TODAY() thì giữ công thức)
+// Các mục kiểm tra dữ liệu (tính bằng script nên không bị lỗi công thức)
+function dataChecks(histRows, catalog, stockByKey) {
+  const codes = {};
+  catalog.forEach((it) => { codes[it.code] = it; });
+  let notInCatalog = 0;
+  let zeroTotal = 0;
+  histRows.forEach((o) => {
+    const code = String(o["Mã SP"] || "").trim();
+    if (code && !codes[code]) notInCatalog += 1;
+    if (o["Loại"] === "BÁN HÀNG" && parseMoney(o["Thành Tiền (VNĐ)"]) === 0) zeroTotal += 1;
+  });
+  const negative = Object.keys(stockByKey).filter((k) => stockByKey[k] < 0).length;
+  const noMargin = catalog.filter((it) => it.sellPrice <= it.importPrice).length;
+  return [
+    ["Giao dịch có Mã SP không có trong Danh mục", notInCatalog],
+    ["Giao dịch bán có thành tiền = 0 (thiếu giá)", zeroTotal],
+    ["Mặt hàng tồn kho âm", negative],
+    ["Mặt hàng có giá bán ≤ giá nhập (lãi 0)", noMargin]
+  ];
+}
+
+/* ------------------------------------------------------------------ */
+/*  Dashboard: chọn NGÀY (B3) + KIỂU XEM (B4) + MẶT HÀNG (B5)             */
+/* ------------------------------------------------------------------ */
+
+function rebuildDashboard(ss, hist, alerts, checks, productNames) {
+  // Giữ lựa chọn của người dùng ở B3, B4, B5
   let dateValue = "=TODAY()";
+  let viewBy = "Ngày";
+  let product = "Tất cả";
   const old = ss.getSheetByName(SHEET.DASH);
   if (old) {
     const cell = old.getRange("B3");
     const f = cell.getFormula();
     if (f) dateValue = f;
     else if (cell.getValue() instanceof Date) dateValue = cell.getValue();
+    const v4 = String(old.getRange("B4").getValue() || "").trim();
+    if (v4) viewBy = v4;
+    const v5 = String(old.getRange("B5").getValue() || "").trim();
+    if (v5) product = v5;
     ss.deleteSheet(old);
   }
 
   const sh = ss.insertSheet(SHEET.DASH);
   const map = headerMap(hist);
+  // Cả cột (không giới hạn số dòng) nên không bao giờ vượt lưới và không tràn dữ liệu
   const rng = (name) => {
     const L = colLetter(map[name]);
-    return SHEET.HISTORY + "!$" + L + "$2:$" + L + "$" + MAX_ROWS;
+    return SHEET.HISTORY + "!$" + L + ":$" + L;
   };
   const DATE = rng("Ngày");
   const TYPE = rng("Loại");
   const NAME = rng("Tên Sản Phẩm");
+  const LOT = rng("Mã Lô");
   const QTY = rng("Số Lượng");
   const TOTAL = rng("Thành Tiền (VNĐ)");
   const PROFIT = rng("Lợi Nhuận (VNĐ)");
   const BAN = "\\"BÁN HÀNG\\"";
   const NHAP = "\\"NHẬP HÀNG\\"";
+  // Khoảng ngày và bộ lọc mặt hàng (ô phụ ở E3:G5)
+  const FROM = "$F$3";
+  const TO = "$F$4";
+  const NAMECRIT = "$F$5";
+  const RANGE = DATE + ",\\">=\\"&" + FROM + "," + DATE + ",\\"<=\\"&" + TO;
+  const NAMEFILTER = "((" + NAME + "=$B$5)+($B$5=\\"Tất cả\\")+($B$5=\\"\\")>0)";
 
-  sh.getRange("A1:H1").merge()
+  sh.getRange("A1:L1").merge()
     .setValue("DASHBOARD BÁN HÀNG")
     .setFontSize(16).setFontWeight("bold").setFontColor("#FFFFFF")
     .setBackground("#7C2D12").setHorizontalAlignment("center");
   sh.getRange("A2")
-    .setValue("Đổi ô B3 sang ngày khác để xem báo cáo của ngày đó. Số liệu tự cập nhật sau mỗi lần ghi.")
+    .setValue("Chọn Ngày (B3), Xem theo Ngày/Tuần/Tháng/Năm/Toàn bộ (B4) và Mặt hàng (B5). Số liệu tự cập nhật sau mỗi lần ghi.")
     .setFontColor("#64748B").setFontStyle("italic");
 
   sh.getRange("A3").setValue("Ngày xem:").setFontWeight("bold");
@@ -469,64 +493,105 @@ function rebuildDashboard(ss, hist, alerts) {
   else b3.setValue(dateValue);
   b3.setNumberFormat("dd/MM/yyyy").setBackground("#FEF3C7").setFontWeight("bold");
 
+  sh.getRange("A4").setValue("Xem theo:").setFontWeight("bold");
+  sh.getRange("B4").setValue(viewBy).setBackground("#FEF3C7").setFontWeight("bold")
+    .setDataValidation(SpreadsheetApp.newDataValidation()
+      .requireValueInList(["Ngày", "Tuần", "Tháng", "Năm", "Toàn bộ"], true).setAllowInvalid(false).build());
+
+  sh.getRange("A5").setValue("Mặt hàng:").setFontWeight("bold");
+  const listNames = ["Tất cả"].concat(productNames.slice(0, 480));
+  if (listNames.indexOf(product) < 0) product = "Tất cả";
+  sh.getRange("B5").setValue(product).setBackground("#FEF3C7").setFontWeight("bold")
+    .setDataValidation(SpreadsheetApp.newDataValidation()
+      .requireValueInList(listNames, true).setAllowInvalid(false).build());
+
+  // Ô phụ: từ ngày / đến ngày / bộ lọc (tự tính từ B3, B4, B5)
+  sh.getRange("E3:E5").setValues([["Từ ngày:"], ["Đến ngày:"], ["Lọc tên:"]]).setFontColor("#64748B");
+  sh.getRange("F3").setFormula(
+    "=IF($B$4=\\"Ngày\\",$B$3,IF($B$4=\\"Tuần\\",$B$3-WEEKDAY($B$3,2)+1,IF($B$4=\\"Tháng\\",DATE(YEAR($B$3),MONTH($B$3),1),IF($B$4=\\"Năm\\",DATE(YEAR($B$3),1,1),DATE(2000,1,1)))))"
+  );
+  sh.getRange("F4").setFormula(
+    "=IF($B$4=\\"Ngày\\",$B$3,IF($B$4=\\"Tuần\\",$B$3-WEEKDAY($B$3,2)+7,IF($B$4=\\"Tháng\\",EOMONTH($B$3,0),IF($B$4=\\"Năm\\",DATE(YEAR($B$3),12,31),DATE(2100,12,31)))))"
+  );
+  sh.getRange("F5").setFormula("=IF(OR($B$5=\\"\\",$B$5=\\"Tất cả\\"),\\"*\\",$B$5)");
+  sh.getRange("F3:F4").setNumberFormat("dd/MM/yyyy").setFontColor("#64748B");
+  sh.getRange("F5").setFontColor("#64748B");
+
   const kpi = [
-    ["Số lần bán trong ngày", "=COUNTIFS(" + DATE + ",$B$3," + TYPE + "," + BAN + ")"],
-    ["Số lượng hàng bán trong ngày", "=SUMIFS(" + QTY + "," + DATE + ",$B$3," + TYPE + "," + BAN + ")"],
-    ["Doanh thu trong ngày (VNĐ)", "=SUMIFS(" + TOTAL + "," + DATE + ",$B$3," + TYPE + "," + BAN + ")"],
-    ["Lợi nhuận trong ngày (VNĐ)", "=SUMIFS(" + PROFIT + "," + DATE + ",$B$3," + TYPE + "," + BAN + ")"],
-    ["Tiền nhập hàng trong ngày (VNĐ)", "=SUMIFS(" + TOTAL + "," + DATE + ",$B$3," + TYPE + "," + NHAP + ")"],
+    ["Số đơn trong kỳ (mỗi lần nói \\"ghi\\" = 1 đơn)",
+      "=IFERROR(COUNTA(UNIQUE(FILTER(" + LOT + "," + TYPE + "=" + BAN + "," + DATE + ">=" + FROM + "," + DATE + "<=" + TO + "," + NAMEFILTER + "))),0)"],
+    ["Số dòng bán trong kỳ", "=COUNTIFS(" + RANGE + "," + TYPE + "," + BAN + "," + NAME + "," + NAMECRIT + ")"],
+    ["Số lượng hàng bán trong kỳ", "=SUMIFS(" + QTY + "," + RANGE + "," + TYPE + "," + BAN + "," + NAME + "," + NAMECRIT + ")"],
+    ["Doanh thu trong kỳ (VNĐ)", "=SUMIFS(" + TOTAL + "," + RANGE + "," + TYPE + "," + BAN + "," + NAME + "," + NAMECRIT + ")"],
+    ["Lợi nhuận trong kỳ (VNĐ)", "=SUMIFS(" + PROFIT + "," + RANGE + "," + TYPE + "," + BAN + "," + NAME + "," + NAMECRIT + ")"],
+    ["Tiền nhập hàng trong kỳ (VNĐ)", "=SUMIFS(" + TOTAL + "," + RANGE + "," + TYPE + "," + NHAP + "," + NAME + "," + NAMECRIT + ")"],
     ["Doanh thu toàn bộ (VNĐ)", "=SUMIFS(" + TOTAL + "," + TYPE + "," + BAN + ")"],
     ["Lợi nhuận toàn bộ (VNĐ)", "=SUMIFS(" + PROFIT + "," + TYPE + "," + BAN + ")"],
     ["Mặt hàng cần chú ý (xem cảnh báo bên phải)", alerts.length]
   ];
-  sh.getRange(5, 1, kpi.length, 2).setFormulas(kpi);
-  sh.getRange("B5:B12").setNumberFormat("#,##0").setFontWeight("bold").setFontColor("#0F766E");
+  sh.getRange(7, 1, kpi.length, 2).setFormulas(kpi);
+  sh.getRange("B7:B15").setNumberFormat("#,##0").setFontWeight("bold").setFontColor("#0F766E");
 
-  // Chi tiết theo mặt hàng của ngày đã chọn
-  sh.getRange("A14").setValue("Chi tiết theo mặt hàng (ngày đã chọn)").setFontWeight("bold");
-  sh.getRange("A15:D15").setValues([["Mặt hàng", "Số lượng", "Doanh thu (VNĐ)", "Lợi nhuận (VNĐ)"]])
+  // Chi tiết theo mặt hàng trong kỳ đã chọn
+  sh.getRange("A17").setValue("Chi tiết theo mặt hàng (kỳ đã chọn)").setFontWeight("bold");
+  sh.getRange("A18:D18").setValues([["Mặt hàng", "Số lượng", "Doanh thu (VNĐ)", "Lợi nhuận (VNĐ)"]])
     .setFontWeight("bold").setFontColor("#FFFFFF").setBackground("#334155");
-  sh.getRange("A16").setFormula(
-    "=IFERROR(SORT(UNIQUE(FILTER(" + NAME + "," + DATE + "=$B$3," + TYPE + "=" + BAN + "," + NAME + "<>\\"\\"))),\\"\\")"
+  sh.getRange("A19").setFormula(
+    "=IFERROR(SORT(UNIQUE(FILTER(" + NAME + "," + TYPE + "=" + BAN + "," + DATE + ">=" + FROM + "," + DATE + "<=" + TO + "," + NAME + "<>\\"\\"," + NAMEFILTER + "))),\\"\\")"
   );
-  sh.getRange("B16").setFormula(
-    "=ARRAYFORMULA(IF(A16:A200=\\"\\",\\"\\",SUMIFS(" + QTY + "," + NAME + ",A16:A200," + DATE + ",$B$3," + TYPE + "," + BAN + ")))"
-  );
-  sh.getRange("C16").setFormula(
-    "=ARRAYFORMULA(IF(A16:A200=\\"\\",\\"\\",SUMIFS(" + TOTAL + "," + NAME + ",A16:A200," + DATE + ",$B$3," + TYPE + "," + BAN + ")))"
-  );
-  sh.getRange("D16").setFormula(
-    "=ARRAYFORMULA(IF(A16:A200=\\"\\",\\"\\",SUMIFS(" + PROFIT + "," + NAME + ",A16:A200," + DATE + ",$B$3," + TYPE + "," + BAN + ")))"
-  );
+  const perName = (SUM) => "=ARRAYFORMULA(IF(A19:A200=\\"\\",\\"\\",SUMIFS(" + SUM + "," + NAME + ",A19:A200," + RANGE + "," + TYPE + "," + BAN + ")))";
+  sh.getRange("B19").setFormula(perName(QTY));
+  sh.getRange("C19").setFormula(perName(TOTAL));
+  sh.getRange("D19").setFormula(perName(PROFIT));
+  sh.getRange("B19:D200").setNumberFormat("#,##0");
 
-  // Doanh thu theo ngày
-  sh.getRange("F14").setValue("Doanh thu theo ngày").setFontWeight("bold");
-  sh.getRange("F15:H15").setValues([["Ngày", "Doanh thu (VNĐ)", "Lợi nhuận (VNĐ)"]])
+  // Doanh thu theo ngày trong kỳ đã chọn
+  sh.getRange("F17").setValue("Doanh thu theo ngày (kỳ đã chọn)").setFontWeight("bold");
+  sh.getRange("F18:H18").setValues([["Ngày", "Doanh thu (VNĐ)", "Lợi nhuận (VNĐ)"]])
     .setFontWeight("bold").setFontColor("#FFFFFF").setBackground("#334155");
-  sh.getRange("F16").setFormula(
-    "=IFERROR(SORT(UNIQUE(FILTER(" + DATE + "," + TYPE + "=" + BAN + "," + DATE + "<>\\"\\")),1,FALSE),\\"\\")"
+  sh.getRange("F19").setFormula(
+    "=IFERROR(SORT(UNIQUE(FILTER(" + DATE + "," + TYPE + "=" + BAN + "," + DATE + ">=" + FROM + "," + DATE + "<=" + TO + "," + DATE + "<>\\"\\"," + NAMEFILTER + ")),1,FALSE),\\"\\")"
   );
-  sh.getRange("G16").setFormula(
-    "=ARRAYFORMULA(IF(F16:F200=\\"\\",\\"\\",SUMIFS(" + TOTAL + "," + DATE + ",F16:F200," + TYPE + "," + BAN + ")))"
+  const perDay = (SUM) => "=ARRAYFORMULA(IF(F19:F200=\\"\\",\\"\\",SUMIFS(" + SUM + "," + DATE + ",F19:F200," + TYPE + "," + BAN + "," + NAME + "," + NAMECRIT + ")))";
+  sh.getRange("G19").setFormula(perDay(TOTAL));
+  sh.getRange("H19").setFormula(perDay(PROFIT));
+  sh.getRange("F19:F200").setNumberFormat("dd/MM/yyyy");
+  sh.getRange("G19:H200").setNumberFormat("#,##0");
+
+  // Doanh thu theo tháng trong kỳ đã chọn
+  sh.getRange("J17").setValue("Doanh thu theo tháng (kỳ đã chọn)").setFontWeight("bold");
+  sh.getRange("J18:L18").setValues([["Tháng", "Doanh thu (VNĐ)", "Lợi nhuận (VNĐ)"]])
+    .setFontWeight("bold").setFontColor("#FFFFFF").setBackground("#334155");
+  sh.getRange("J19").setFormula(
+    "=IFERROR(SORT(UNIQUE(ARRAYFORMULA(EOMONTH(FILTER(" + DATE + "," + TYPE + "=" + BAN + "," + DATE + ">=" + FROM + "," + DATE + "<=" + TO + "," + DATE + "<>\\"\\"," + NAMEFILTER + "),-1)+1)),1,FALSE),\\"\\")"
   );
-  sh.getRange("H16").setFormula(
-    "=ARRAYFORMULA(IF(F16:F200=\\"\\",\\"\\",SUMIFS(" + PROFIT + "," + DATE + ",F16:F200," + TYPE + "," + BAN + ")))"
-  );
-  sh.getRange("F16:F200").setNumberFormat("dd/MM/yyyy");
-  sh.getRange("C16:D200").setNumberFormat("#,##0");
-  sh.getRange("G16:H200").setNumberFormat("#,##0");
+  const perMonth = (SUM) => "=ARRAYFORMULA(IF(J19:J200=\\"\\",\\"\\",IFERROR(SUMIFS(" + SUM + "," + DATE + ",\\">=\\"&J19:J200," + DATE + ",\\"<=\\"&EOMONTH(J19:J200,0)," + TYPE + "," + BAN + "," + NAME + "," + NAMECRIT + "),\\"\\")))";
+  sh.getRange("K19").setFormula(perMonth(TOTAL));
+  sh.getRange("L19").setFormula(perMonth(PROFIT));
+  sh.getRange("J19:J200").setNumberFormat("MM/yyyy");
+  sh.getRange("K19:L200").setNumberFormat("#,##0");
 
   // Cảnh báo tồn kho (cập nhật sau mỗi lần ghi)
-  sh.getRange("J14").setValue("Cảnh báo tồn kho").setFontWeight("bold");
-  sh.getRange("J15:L15").setValues([["Mặt hàng", "Tồn kho", "Tình trạng"]])
+  sh.getRange("N17").setValue("Cảnh báo tồn kho").setFontWeight("bold");
+  sh.getRange("N18:P18").setValues([["Mặt hàng", "Tồn kho", "Tình trạng"]])
     .setFontWeight("bold").setFontColor("#FFFFFF").setBackground("#334155");
   if (alerts.length > 0) {
-    sh.getRange(16, 10, alerts.length, 3).setValues(alerts.map((a) => [a.name, a.stock, a.warn]));
+    sh.getRange(19, 14, alerts.length, 3).setValues(alerts.map((a) => [a.name, a.stock, a.warn]));
+    sh.getRange(19, 16, alerts.length, 1).setFontColor("#B91C1C");
   } else {
-    sh.getRange("J16").setValue("Không có mặt hàng cần chú ý.").setFontStyle("italic");
+    sh.getRange("N19").setValue("Không có mặt hàng cần chú ý.").setFontStyle("italic");
   }
 
-  const widths = { 1: 260, 2: 130, 3: 150, 4: 150, 5: 20, 6: 120, 7: 150, 8: 150, 9: 20, 10: 240, 11: 100, 12: 230 };
+  // Kiểm tra dữ liệu
+  sh.getRange("R17").setValue("Kiểm tra dữ liệu").setFontWeight("bold");
+  sh.getRange("R18:S18").setValues([["Hạng mục", "Số dòng"]])
+    .setFontWeight("bold").setFontColor("#FFFFFF").setBackground("#334155");
+  sh.getRange(19, 18, checks.length, 2).setValues(checks);
+  checks.forEach((c, i) => {
+    if (c[1] > 0) sh.getRange(19 + i, 19).setFontColor("#B91C1C").setFontWeight("bold");
+  });
+
+  const widths = { 1: 300, 2: 130, 3: 150, 4: 150, 5: 90, 6: 120, 7: 150, 8: 150, 9: 20, 10: 110, 11: 150, 12: 150, 13: 20, 14: 240, 15: 100, 16: 230, 17: 20, 18: 330, 19: 90 };
   Object.keys(widths).forEach((c) => sh.setColumnWidth(Number(c), widths[c]));
   sh.setHiddenGridlines(true);
 }
@@ -662,9 +727,12 @@ function appendTransactionRow(hist, tx, catalog) {
     "Đơn Giá (VNĐ)": unitPrice,
     "Thành Tiền (VNĐ)": total,
     "Lợi Nhuận (VNĐ)": profit,
-    "Câu Thoại Gốc": tx.rawTranscript || ""
+    "Câu Thoại Gốc": tx.rawTranscript || "",
+    "Tháng": Utilities.formatDate(d, TZ, "yyyy-MM"),
+    "Năm": Number(Utilities.formatDate(d, TZ, "yyyy"))
   });
   formatCells(hist, row, {
+    "Tháng": "@",
     "Ngày": "dd/MM/yyyy",
     "Đơn Giá (VNĐ)": "#,##0",
     "Thành Tiền (VNĐ)": "#,##0",
@@ -696,7 +764,13 @@ function saveBatch(ss, txs, rawContent, tgCfg) {
   const catalog = getCatalog(ss);
   migrateHistory(hist, catalog);
 
-  const rows = txs.map((tx) => appendTransactionRow(hist, tx, catalog));
+  // Bỏ giao dịch đã có (cùng Mã GD) để gửi lại không bị ghi trùng
+  const existingIds = {};
+  readObjects(hist).forEach((o) => { if (o["Mã GD"]) existingIds[String(o["Mã GD"])] = true; });
+  const fresh = txs.filter((tx) => !(tx.id && existingIds[String(tx.id)]));
+  if (fresh.length === 0) return;
+
+  const rows = fresh.map((tx) => appendTransactionRow(hist, tx, catalog));
   const stockByKey = syncDerivedSheets(ss, hist, catalog);
 
   rows.forEach((r) => {
@@ -714,11 +788,32 @@ function saveBatch(ss, txs, rawContent, tgCfg) {
 }
 
 // Tính lại BanHangNgay, TonKho, Dashboard từ LichSuGiaoDich. Trả về tồn kho theo khoá sản phẩm.
+function ensureHistoryFilter(hist) {
+  if (!hist.getFilter()) {
+    hist.getRange(1, 1, Math.max(hist.getMaxRows(), 2), Math.max(hist.getLastColumn(), 1)).createFilter();
+  }
+}
+
+// Xoá các sheet tự động cũ không còn dùng (gộp vào Dashboard + bộ lọc của LichSuGiaoDich)
+function removeOldSheets(ss) {
+  ["BanHangNgay", "TongHopNgay", "TongHopThang", "TongHopNam", "TongHopMatHang"].forEach((n) => {
+    const old = ss.getSheetByName(n);
+    if (old && ss.getSheets().length > 1) ss.deleteSheet(old);
+  });
+}
+
 function syncDerivedSheets(ss, hist, catalog) {
+  ensureHistoryFilter(hist);
   const histRows = readObjects(hist);
-  rebuildSales(ss, histRows);
   const st = rebuildStock(ss, histRows, catalog);
-  rebuildDashboard(ss, hist, st.alerts);
+  const names = [];
+  const seen = {};
+  histRows.forEach((o) => {
+    const n = String(o["Tên Sản Phẩm"] || "").trim();
+    if (n && !seen[n]) { seen[n] = true; names.push(n); }
+  });
+  names.sort();
+  rebuildDashboard(ss, hist, st.alerts, dataChecks(histRows, catalog, st.byKey), names);
   return st.byKey;
 }
 
@@ -733,6 +828,7 @@ function setupAllSheets() {
   ensureLogSheet(ss, SHEET.DEBUG, HEADERS.HeThongDebug);
   const catalog = getCatalog(ss);
   migrateHistory(hist, catalog);
+  removeOldSheets(ss);
   syncDerivedSheets(ss, hist, catalog);
   Logger.log("Đã tạo/cập nhật các sheet. Danh mục: " + catalog.length + " sản phẩm.");
 }
