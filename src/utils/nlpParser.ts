@@ -351,6 +351,34 @@ export function parseVietnameseCommand(transcript: string): ParsedVoiceResult {
 /*  - Đoạn không có từ hành động sẽ dùng hành động của đoạn trước       */
 /*  - Cuối câu: "ghi" = lưu ngay, "đọc" = đọc lại, "đọc ghi" = cả hai    */
 /* ------------------------------------------------------------------ */
+/* Tách một đoạn thành nhiều mặt hàng khi gặp lại cụm "số + đơn vị".
+ * VD: "bán 5 gói mì hảo hảo 5 chai aquafina" -> ["bán 5 gói mì hảo hảo", "5 chai aquafina"]
+ * Đoạn đầu giữ nguyên từ hành động; các đoạn sau sẽ nhận hành động mặc định ở bước sau. */
+function splitByQuantityUnit(segment: string): string[] {
+  const tokens = segment.split(/\s+/).filter(Boolean);
+  const lower = tokens.map((t) => t.toLowerCase());
+  const cuts: number[] = [];
+  let pairSeen = false;
+  for (let i = 0; i < tokens.length - 1; i++) {
+    const n = parseNumberAt(lower, i);
+    if (!n) continue;
+    const unitTok = lower[i + n.length];
+    if (!unitTok || !UNIT_MAP[unitTok]) continue;
+    if (pairSeen && i > 0) cuts.push(i);
+    pairSeen = true;
+    i += n.length - 1;
+  }
+  if (cuts.length === 0) return [segment];
+  const parts: string[] = [];
+  let start = 0;
+  for (const c of cuts) {
+    parts.push(tokens.slice(start, c).join(' '));
+    start = c;
+  }
+  parts.push(tokens.slice(start).join(' '));
+  return parts.filter(Boolean);
+}
+
 export interface MultiVoiceResult {
   items: ParsedVoiceResult[];
   readRequested: boolean;
@@ -359,7 +387,7 @@ export interface MultiVoiceResult {
 
 const SAVE_TAIL = /(?:^|[\s,.\-;!]+)(đọc[\s,.\-]+)?ghi[\s.!]*$/iu;
 const READ_TAIL = /(?:^|[\s,.\-;!]+)đọc[\s.!]*$/iu;
-const SEGMENT_SPLIT = /\s+[-–]\s+|\s*;\s*|,\s+|\s+rồi\s+/u;
+const SEGMENT_SPLIT = /\s+[-–]\s+|\s*;\s*|,\s+|\s+rồi\s+|\s+và\s+(?=\d)/u;
 
 export function parseVietnameseMulti(
   transcript: string,
@@ -382,10 +410,10 @@ export function parseVietnameseMulti(
     }
   }
 
-  const segments = work
-    .split(SEGMENT_SPLIT)
-    .map((s) => s.trim())
-    .filter(Boolean);
+  // Tách theo dấu câu / từ nối trước
+  const coarse = work.split(SEGMENT_SPLIT).map((s) => s.trim()).filter(Boolean);
+  // Nhận dạng giọng nói thường KHÔNG có dấu phẩy: tách tiếp tại mỗi "số + đơn vị" mới
+  const segments = coarse.flatMap(splitByQuantityUnit);
 
   const items: ParsedVoiceResult[] = [];
   // Đoạn không nói hành động thì dùng hành động trước đó, hoặc mặc định của phiên
@@ -403,4 +431,46 @@ export function parseVietnameseMulti(
   }
 
   return { items, readRequested, saveRequested };
+}
+
+/**
+ * GOM LỆNH: cộng dồn các mặt hàng mới nói vào giỏ đang chờ.
+ * Cùng hành động + cùng mặt hàng + cùng đơn vị + cùng đơn giá thì CỘNG SỐ LƯỢNG
+ * (vd: "5 chai aquafina" rồi "5 chai aquafina" nữa -> 10 chai).
+ * Dòng chưa rõ / còn nhập nhằng được giữ riêng để người dùng sửa hoặc bỏ.
+ */
+export function mergePendingItems(
+  existing: ParsedVoiceResult[],
+  incoming: ParsedVoiceResult[]
+): ParsedVoiceResult[] {
+  const key = (p: ParsedVoiceResult) =>
+    [p.action, p.productName.trim().toLowerCase(), (p.unit || '').trim().toLowerCase(), p.unitPrice ?? ''].join('|');
+  const mergeable = (p: ParsedVoiceResult) =>
+    p.isValid && !!p.action && !!p.quantity && !!p.productName && p.matchStatus !== 'ambiguous' && p.matchStatus !== 'unknown';
+
+  const out = existing.map((p) => ({ ...p }));
+  for (const inc of incoming) {
+    const idx = mergeable(inc) ? out.findIndex((o) => mergeable(o) && key(o) === key(inc)) : -1;
+    if (idx < 0) {
+      out.push({ ...inc });
+      continue;
+    }
+    const cur = out[idx];
+    const qty = (cur.quantity as number) + (inc.quantity as number);
+    const unitPrice = cur.unitPrice ?? inc.unitPrice ?? null;
+    const total =
+      cur.totalPrice != null && inc.totalPrice != null
+        ? cur.totalPrice + inc.totalPrice
+        : unitPrice
+          ? Math.round(unitPrice * qty)
+          : cur.totalPrice ?? inc.totalPrice ?? null;
+    out[idx] = {
+      ...cur,
+      quantity: qty,
+      totalPrice: total,
+      rawTranscript:
+        cur.rawTranscript === inc.rawTranscript ? cur.rawTranscript : `${cur.rawTranscript} | ${inc.rawTranscript}`,
+    };
+  }
+  return out;
 }

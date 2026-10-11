@@ -28,7 +28,7 @@ import {
 } from 'lucide-react';
 
 import { Transaction, TransactionType, InventoryItem, AppSettings, ParsedVoiceResult } from './types';
-import { parseVietnameseMulti } from './utils/nlpParser';
+import { parseVietnameseMulti, mergePendingItems } from './utils/nlpParser';
 import { playSoundTone, speakVietnamese } from './utils/audioFeedback';
 import { buildVietQrUrl, buildTransferNote } from './utils/vietqr';
 import type { CatalogItem } from './utils/catalogMatch';
@@ -274,6 +274,8 @@ export default function App() {
   // Hành động gần nhất: dùng cho đoạn nói không có từ "bán"/"nhập" (vd: "1 chai aquafina - ghi")
   const lastActionRef = useRef<'NHAP' | 'BAN'>('BAN');
   const commitRef = useRef<(parsed: ParsedVoiceResult) => void>(() => {});
+  // Giỏ chờ: gom MỌI câu nói (kể cả khi nhận dạng giọng nói tách thành nhiều đoạn) cho tới khi nói "ghi"
+  const pendingRef = useRef<ParsedVoiceResult[]>([]);
 
   // Lấy tồn kho hiện tại của một sản phẩm
   const getProductStock = (productName: string, unit: string): number => {
@@ -627,6 +629,23 @@ export default function App() {
     clearAutoSaveTimer();
   };
 
+  // Giữ giỏ chờ khớp với state (khi người dùng sửa / hủy / chọn mặt hàng trên màn hình)
+  useEffect(() => {
+    pendingRef.current = parsedBatch.length > 0 ? parsedBatch : parsedResult ? [parsedResult] : [];
+  }, [parsedBatch, parsedResult]);
+
+  // Đặt giỏ chờ: 1 dòng -> thẻ đơn, nhiều dòng -> thẻ gom
+  const setPending = (items: ParsedVoiceResult[]) => {
+    pendingRef.current = items;
+    setParsedResult(items.length === 1 ? items[0] : null);
+    setParsedBatch(items.length > 1 ? items : []);
+  };
+
+  // Bỏ một dòng khỏi giỏ chờ
+  const removePendingItem = (idx: number) => {
+    setPending(pendingRef.current.filter((_, i) => i !== idx));
+  };
+
   // --- Handle Transcript & NLP Parsing ---
   // Chỉ xử lý khi kết quả giọng nói đã chốt (isFinal = true).
   // Một lệnh có thể chứa nhiều mặt hàng, ngăn cách bằng " - " hoặc dấu phẩy.
@@ -643,29 +662,35 @@ export default function App() {
       return resolved.matchStatus === 'no_catalog' ? applyAutoPrice(resolved, inventory) : resolved;
     });
 
-    // Chỉ nói "ghi" / "đọc" mà không có mặt hàng: áp dụng cho lệnh đang chờ
+    // Chỉ nói "ghi" / "đọc" mà không có mặt hàng: áp dụng cho cả giỏ đang chờ
     if (prepared.length === 0) {
-      const pending = parsedBatch.length > 0 ? parsedBatch : parsedResult ? [parsedResult] : [];
+      const pending = pendingRef.current;
       if (multi.saveRequested && pending.length > 0) {
         commitBatch(pending, multi.readRequested);
+      } else if (multi.readRequested && pending.length > 0 && settings.voiceFeedbackEnabled) {
+        speakVietnamese(
+          buildSpokenReadBack(pending.map((p) => ({ type: p.action, quantity: p.quantity, unit: p.unit, productName: p.productName, totalPrice: p.totalPrice })), true),
+          settings.speechRate
+        );
       }
       return;
     }
 
-    const allReady = prepared.every((p) => p.isValid && p.matchStatus !== 'ambiguous');
+    // GOM LỆNH: cộng dồn vào giỏ chờ (cùng mặt hàng, cùng giá thì cộng số lượng)
+    const merged = mergePendingItems(pendingRef.current, prepared);
+    const allReady = merged.every((p) => p.isValid && p.matchStatus !== 'ambiguous');
 
     if (multi.saveRequested && allReady) {
-      commitBatch(prepared, multi.readRequested);
+      commitBatch(merged, multi.readRequested);
       return;
     }
 
-    // Chưa ghi: hiển thị để kiểm tra
-    setParsedResult(prepared.length === 1 ? prepared[0] : null);
-    setParsedBatch(prepared.length > 1 ? prepared : []);
+    // Chưa ghi: hiển thị cả giỏ để kiểm tra, chờ nói "ghi"
+    setPending(merged);
 
     if (multi.readRequested && settings.voiceFeedbackEnabled) {
       speakVietnamese(
-        buildSpokenReadBack(prepared.map((p) => ({ type: p.action, quantity: p.quantity, unit: p.unit, productName: p.productName, totalPrice: p.totalPrice })), true),
+        buildSpokenReadBack(merged.map((p) => ({ type: p.action, quantity: p.quantity, unit: p.unit, productName: p.productName, totalPrice: p.totalPrice })), true),
         settings.speechRate
       );
     }
@@ -815,6 +840,7 @@ export default function App() {
         t.id
       );
     }
+    pendingRef.current = [];
     setParsedResult(null);
     setParsedBatch([]);
     setLiveTranscript('');
@@ -1003,6 +1029,7 @@ export default function App() {
   // --- Hủy kết quả hiện tại ---
   const handleCancelResult = () => {
     clearAutoSaveTimer();
+    pendingRef.current = [];
     setParsedResult(null);
     setParsedBatch([]);
     setLiveTranscript('');
@@ -1441,7 +1468,7 @@ export default function App() {
                   <div className="bg-slate-850 border border-slate-700/80 rounded-2xl p-5 text-left space-y-3 shadow-xl">
                     <div className="flex items-center justify-between border-b border-slate-700/60 pb-3">
                       <span className="text-xs font-bold text-slate-300 uppercase tracking-wide">
-                        {parsedBatch.length} mặt hàng trong một lệnh
+                        Đơn đang gom · {parsedBatch.length} mặt hàng (nói "ghi" để lưu)
                       </span>
                       <button
                         onClick={handleCancelResult}
@@ -1457,8 +1484,15 @@ export default function App() {
                             {p.action === 'NHAP' ? 'Nhập' : p.action === 'BAN' ? 'Bán' : '?'}{' '}
                             {p.quantity ?? '?'} {p.unit} {p.productName || '(chưa rõ tên)'}
                           </span>
-                          <span className="text-slate-300 whitespace-nowrap">
+                          <span className="flex items-center gap-2 text-slate-300 whitespace-nowrap">
                             {p.totalPrice ? formatVND(p.totalPrice) : <span className="text-slate-500">Không có giá</span>}
+                            <button
+                              onClick={() => removePendingItem(idx)}
+                              title="Bỏ dòng này"
+                              className="text-slate-500 hover:text-rose-400 cursor-pointer px-1"
+                            >
+                              ✕
+                            </button>
                           </span>
                         </li>
                       ))}
