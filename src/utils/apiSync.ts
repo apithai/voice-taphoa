@@ -283,73 +283,34 @@ export async function sendTelegramMessage(
   chatId: string,
   text: string
 ): Promise<{ success: boolean; message: string }> {
-  if (!botToken || !chatId) {
+  if (!botToken?.trim() || !chatId?.trim()) {
     return { success: false, message: 'Chưa cấu hình Telegram Bot Token hoặc Chat ID.' };
   }
 
-  let cleanToken = botToken.trim();
-  if (cleanToken.toLowerCase().startsWith('bot')) {
-    cleanToken = cleanToken.slice(3).trim();
-  }
+  const cleanToken = botToken.trim().replace(/^bot/i, '').trim();
   const cleanChatId = chatId.trim();
 
-  // 1. Thử gửi qua endpoint proxy của máy chủ trước (tránh chặn CORS / chặn DNS nhà mạng VN)
+  // Chỉ gửi qua server cùng nguồn. Gọi Telegram trực tiếp từ trình duyệt dễ gặp CORS
+  // và làm lộ Bot Token trong DevTools/network log.
   try {
-    const proxyRes = await fetch('/api/telegram/send', {
+    const response = await fetch('/api/telegram/send', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        botToken: cleanToken,
-        chatId: cleanChatId,
-        text,
-      }),
+      body: JSON.stringify({ botToken: cleanToken, chatId: cleanChatId, text }),
     });
-
-    const proxyData = await proxyRes.json().catch(() => null);
-    if (proxyRes.ok && proxyData?.success) {
-      return { success: true, message: proxyData.message || 'Đã gửi thông báo Telegram thành công!' };
+    const data = await response.json().catch(() => null);
+    if (response.ok && data?.success) {
+      return { success: true, message: data.message || 'Telegram đã xác nhận gửi thành công.' };
     }
-    if (proxyData && proxyData.message && !proxyRes.ok) {
-      // Máy chủ phản hồi lỗi từ Telegram (sai token, sai chat ID, ...)
-      return { success: false, message: proxyData.message };
-    }
-  } catch (_err) {
-    // Nếu không kết nối được tới endpoint máy chủ (ví dụ chạy offline/file standalone), thử gọi trực tiếp bên dưới
-  }
-
-  // 2. Dự phòng: gọi trực tiếp Telegram Bot API
-  const url = `https://api.telegram.org/bot${cleanToken}/sendMessage`;
-  try {
-    const res = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: cleanChatId,
-        text: text,
-        parse_mode: 'HTML',
-      }),
-    });
-
-    const data = await res.json();
-    if (data.ok) {
-      return { success: true, message: 'Đã gửi thông báo Telegram thành công!' };
-    } else {
-      let desc = data.description || 'Không xác định';
-      if (desc.includes('chat not found')) {
-        desc = 'Chat ID không đúng hoặc bạn chưa mở tin nhắn với bot và bấm /start.';
-      } else if (desc.includes('Unauthorized')) {
-        desc = 'Bot Token không hợp lệ. Vui lòng kiểm tra lại token từ @BotFather.';
-      }
-      return {
-        success: false,
-        message: `Telegram báo lỗi: ${desc}`,
-      };
-    }
-  } catch (error) {
-    console.error('Lỗi gửi Telegram:', error);
     return {
       success: false,
-      message: `Lỗi mạng khi gọi Telegram Bot: ${(error as Error).message}`,
+      message: data?.message || `Máy chủ Telegram trả về HTTP ${response.status}. Kiểm tra server.ts và cấu hình bot.`,
+    };
+  } catch (error) {
+    console.error('Không gọi được endpoint Telegram cùng nguồn:', error);
+    return {
+      success: false,
+      message: 'Không kết nối được /api/telegram/send. Bản triển khai hiện tại chưa có server proxy hoạt động; không thử gọi Telegram trực tiếp từ trình duyệt vì dễ lỗi CORS và lộ Bot Token.',
     };
   }
 }
